@@ -42,9 +42,9 @@ scripts/
 ```
 
 ## Dataset
-The experiments use the EmojiHeroVR database:
+- The experiments use the EmojiHeroVR database:
 https://github.com/thorbenortmann/emoji-hero-vr-database
 
-Expected local dataset path:
+- Expected local dataset path:
 data_ori/emoji-hero-vr-db-si/
 
