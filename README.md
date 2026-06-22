@@ -37,9 +37,14 @@ The current experiment compares:
 
 ```text
 scripts/
-  train_loo.py   Main LOO FER and personalization experiment
-Dataset
+  train_loo.py            Main LOO FER personalization experiment
+  train_verification.py   Enrollment/probe user verification experiment
+```
+
+## Dataset
 The experiments use the EmojiHeroVR database:
 https://github.com/thorbenortmann/emoji-hero-vr-database
+
 Expected local dataset path:
 data_ori/emoji-hero-vr-db-si/
+
