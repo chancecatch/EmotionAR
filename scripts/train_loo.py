@@ -644,8 +644,8 @@ ABCD_FOLD_FIELDS = [
     'Non-Neutral Accuracy',
     'Non-Neutral Macro F1 Score',
     'Win Tie Loss Compared With Subject-Independent Base',
-    'Accuracy Difference From Base Percentage Points',
-    'Macro F1 Difference From Base Percentage Points',
+    'Paired Accuracy Difference From Same Held-Out User Base Percentage Points',
+    'Paired Macro F1 Difference From Same Held-Out User Base Percentage Points',
     'Base Model Training Time Seconds',
     'Joint Identity Emotion Embedding Training Time Seconds',
     'User Profile Construction Time Seconds',
@@ -670,8 +670,8 @@ ABCD_SUMMARY_FIELDS = [
     'Macro F1 Score Standard Deviation',
     'Mean Non-Neutral Accuracy',
     'Mean Non-Neutral Macro F1 Score',
-    'Mean Accuracy Difference From Base Percentage Points',
-    'Mean Macro F1 Difference From Base Percentage Points',
+    'Mean Paired Accuracy Difference From Same Held-Out User Base Percentage Points',
+    'Mean Paired Macro F1 Difference From Same Held-Out User Base Percentage Points',
     'Users Improved Compared With Base',
     'Users Tied Compared With Base',
     'Users Worse Compared With Base',
@@ -683,6 +683,7 @@ ABCD_SUMMARY_FIELDS = [
     'Mean Included User Count',
     'All User Count',
     'Summary Mean Inclusion Rule Full Name',
+    'Excluded Missing Enrollment User-Emotion Pair Count',
     'Excluded Missing Enrollment User-Emotion Pairs',
 ]
 
@@ -806,7 +807,18 @@ def read_csv_rows(path):
     if not path.exists():
         return []
     with open(path, newline='') as csvfile:
-        return list(csv.DictReader(csvfile))
+        rows = list(csv.DictReader(csvfile))
+    field_aliases = {
+        'Paired Accuracy Difference From Same Held-Out User Base Percentage Points':
+            'Accuracy Difference From Base Percentage Points',
+        'Paired Macro F1 Difference From Same Held-Out User Base Percentage Points':
+            'Macro F1 Difference From Base Percentage Points',
+    }
+    for row in rows:
+        for new_field, old_field in field_aliases.items():
+            if not row.get(new_field) and row.get(old_field):
+                row[new_field] = row[old_field]
+    return rows
 
 
 def write_json(path, payload):
@@ -1442,12 +1454,10 @@ def evaluate_film_model(film_model, feature_map, profile_vector, test_records, d
     return prediction_metrics(labels, preds, time.time() - start)
 
 
-def evaluate_prototype_model(feature_map, profile_vector, feature_dim, test_records,
-                             unavailable_labels=None):
+def evaluate_prototype_model(feature_map, profile_vector, feature_dim, test_records):
     prototypes = profile_vector.reshape(len(EMOTIONS), feature_dim)
     prototype_norms = np.linalg.norm(prototypes, axis=1)
-    masked_labels = set(int(label) for label in (unavailable_labels or []))
-    masked_labels.update(int(label) for label in np.where(prototype_norms <= 1e-8)[0])
+    masked_labels = set(int(label) for label in np.where(prototype_norms <= 1e-8)[0])
     labels, preds = [], []
     start = time.time()
     for record in test_records:
@@ -1503,8 +1513,8 @@ def abcd_result_row(condition_key, heldout_user, result, splits, base_result=Non
         'Non-Neutral Accuracy': result['other_accuracy'],
         'Non-Neutral Macro F1 Score': result['other_f1'],
         'Win Tie Loss Compared With Subject-Independent Base': win_tie_loss,
-        'Accuracy Difference From Base Percentage Points': delta_acc,
-        'Macro F1 Difference From Base Percentage Points': delta_f1,
+        'Paired Accuracy Difference From Same Held-Out User Base Percentage Points': delta_acc,
+        'Paired Macro F1 Difference From Same Held-Out User Base Percentage Points': delta_f1,
         'Base Model Training Time Seconds': base_time,
         'Joint Identity Emotion Embedding Training Time Seconds': joint_embedding_time,
         'User Profile Construction Time Seconds': profile_time,
@@ -1577,6 +1587,15 @@ def abcd_manifest_rows_for_split(heldout_user, splits, model_condition='All Cond
     return rows
 
 
+def row_float(row, field, fallback_field=None, default=0.0):
+    value = row.get(field, '')
+    if (value is None or value == '') and fallback_field:
+        value = row.get(fallback_field, '')
+    if value is None or value == '':
+        return default
+    return float(value)
+
+
 def summarize_abcd_rows(fold_rows):
     grouped = defaultdict(list)
     for row in fold_rows:
@@ -1592,8 +1611,22 @@ def summarize_abcd_rows(fold_rows):
         f1_values = [float(row['Macro F1 Score']) for row in included_rows]
         other_acc = [float(row['Non-Neutral Accuracy']) for row in included_rows]
         other_f1 = [float(row['Non-Neutral Macro F1 Score']) for row in included_rows]
-        delta_acc = [float(row['Accuracy Difference From Base Percentage Points']) for row in included_rows]
-        delta_f1 = [float(row['Macro F1 Difference From Base Percentage Points']) for row in included_rows]
+        delta_acc = [
+            row_float(
+                row,
+                'Paired Accuracy Difference From Same Held-Out User Base Percentage Points',
+                fallback_field='Accuracy Difference From Base Percentage Points',
+            )
+            for row in included_rows
+        ]
+        delta_f1 = [
+            row_float(
+                row,
+                'Paired Macro F1 Difference From Same Held-Out User Base Percentage Points',
+                fallback_field='Macro F1 Difference From Base Percentage Points',
+            )
+            for row in included_rows
+        ]
         total_times = [float(row['Total Training Or Adaptation Time Seconds']) for row in included_rows]
         joint_times = [float(row.get('Joint Identity Emotion Embedding Training Time Seconds', 0) or 0) for row in included_rows]
         profile_times = [float(row['User Profile Construction Time Seconds']) for row in included_rows]
@@ -1612,6 +1645,7 @@ def summarize_abcd_rows(fold_rows):
                     f"User {row['Held-Out User ID']}: {row['Missing Enrollment Emotion Names']}"
                 )
         excluded_label = '; '.join(excluded_pairs)
+        excluded_pair_count = len(excluded_pairs)
         inclusion_rule = (
             f"Mean excludes missing-enrollment rows: {excluded_label}"
             if excluded_label else "Mean includes all held-out users"
@@ -1626,8 +1660,8 @@ def summarize_abcd_rows(fold_rows):
             'Macro F1 Score Standard Deviation': float(np.std(f1_values)),
             'Mean Non-Neutral Accuracy': float(np.mean(other_acc)),
             'Mean Non-Neutral Macro F1 Score': float(np.mean(other_f1)),
-            'Mean Accuracy Difference From Base Percentage Points': float(np.mean(delta_acc)),
-            'Mean Macro F1 Difference From Base Percentage Points': float(np.mean(delta_f1)),
+            'Mean Paired Accuracy Difference From Same Held-Out User Base Percentage Points': float(np.mean(delta_acc)),
+            'Mean Paired Macro F1 Difference From Same Held-Out User Base Percentage Points': float(np.mean(delta_f1)),
             'Users Improved Compared With Base': wins,
             'Users Tied Compared With Base': ties,
             'Users Worse Compared With Base': losses,
@@ -1639,6 +1673,7 @@ def summarize_abcd_rows(fold_rows):
             'Mean Included User Count': len(included_rows),
             'All User Count': len(rows),
             'Summary Mean Inclusion Rule Full Name': inclusion_rule,
+            'Excluded Missing Enrollment User-Emotion Pair Count': excluded_pair_count,
             'Excluded Missing Enrollment User-Emotion Pairs': excluded_label,
         })
     return sorted(summary_rows, key=lambda row: (row.get('Model Name', ''), row['Condition Full Name']))
@@ -1810,7 +1845,6 @@ def run_abcd_b_conditions(args, model_name, heldout_user, splits, base_state, ba
         if not abcd_is_complete(status, model_name, heldout_user, proto_key):
             result = evaluate_prototype_model(
                 feature_map, heldout_profile, feature_dim, splits['test_records'],
-                unavailable_labels=missing,
             )
             row = abcd_result_row(
                 proto_key, heldout_user, result, splits, base_result=base_result,
