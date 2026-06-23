@@ -20,10 +20,11 @@ import argparse
 import copy
 import csv
 import json
+import math
 import random
 import numpy as np
 from pathlib import Path
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime
 import time
 
@@ -34,7 +35,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from PIL import Image
 import timm
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, precision_recall_fscore_support
 from tqdm import tqdm
 import torchvision
 from mlflow.models.signature import infer_signature
@@ -622,6 +623,11 @@ def is_classifier_parameter(name):
     )
 
 
+def is_final_projection_parameter(name):
+    name_parts = name.split('.')
+    return name_parts[0] in {'conv_head', 'bn2'} or name_parts[-1] in {'conv_head', 'bn2'}
+
+
 def get_classifier_parameters(model):
     params = [param for name, param in model.named_parameters() if is_classifier_parameter(name)]
     if params:
@@ -638,39 +644,60 @@ def setup_partial_unfreeze(model, unfreeze_ratio='third'):
     fall back to unfreezing the last fraction of named parameters plus the
     classifier/head.
     """
-    if unfreeze_ratio == 'full':
+    mode_aliases = {
+        'classifier_head_only': 'classifier_head_only',
+        'last_two_blocks_plus_head': 'last_two_blocks_plus_head',
+        'third': 'last_two_blocks_plus_head',
+        'upper_half_backbone_plus_head': 'upper_half_backbone_plus_head',
+        'half': 'upper_half_backbone_plus_head',
+        'full_network': 'full_network',
+        'full': 'full_network',
+    }
+    unfreeze_mode = mode_aliases.get(unfreeze_ratio)
+    if unfreeze_mode is None:
+        raise ValueError(f"Unknown unfreeze_ratio: {unfreeze_ratio}")
+
+    if unfreeze_mode == 'full_network':
         for param in model.parameters():
             param.requires_grad = True
-        print(f"  [Unfreeze: full] All layers trainable")
+        print(f"  [Unfreeze: {unfreeze_ratio}] All layers trainable")
         return model
-    
-    if unfreeze_ratio not in {'third', 'half'}:
-        raise ValueError(f"Unknown unfreeze_ratio: {unfreeze_ratio}")
-    
+
     for param in model.parameters():
         param.requires_grad = False
 
     named_params = list(model.named_parameters())
     has_efficientnet_blocks = any(name.startswith('blocks.') for name, _ in named_params)
     if has_efficientnet_blocks:
-        if unfreeze_ratio == 'third':
+        if unfreeze_mode == 'classifier_head_only':
+            unfreeze_blocks = []
+        elif unfreeze_mode == 'last_two_blocks_plus_head':
             unfreeze_blocks = [5, 6]
-        else:
+        elif unfreeze_mode == 'upper_half_backbone_plus_head':
             unfreeze_blocks = [3, 4, 5, 6]
+        else:
+            raise ValueError(f"Unsupported EfficientNet unfreeze mode: {unfreeze_mode}")
         for name, param in named_params:
-            if is_classifier_parameter(name):
+            if is_classifier_parameter(name) or is_final_projection_parameter(name):
                 param.requires_grad = True
             for block_num in unfreeze_blocks:
                 if f'blocks.{block_num}' in name:
                     param.requires_grad = True
-        print(f"  [Unfreeze: {unfreeze_ratio}] EfficientNet blocks {unfreeze_blocks} + classifier")
+        print(f"  [Unfreeze: {unfreeze_ratio}] EfficientNet blocks {unfreeze_blocks} + final projection + classifier/head")
     else:
-        fraction = 1 / 3 if unfreeze_ratio == 'third' else 1 / 2
+        if unfreeze_mode == 'classifier_head_only':
+            fraction = 0
+        elif unfreeze_mode == 'last_two_blocks_plus_head':
+            fraction = 1 / 3
+        elif unfreeze_mode == 'upper_half_backbone_plus_head':
+            fraction = 1 / 2
+        else:
+            raise ValueError(f"Unsupported generic unfreeze mode: {unfreeze_mode}")
         start_idx = max(0, int(len(named_params) * (1 - fraction)))
         for idx, (name, param) in enumerate(named_params):
-            if idx >= start_idx or is_classifier_parameter(name):
+            if idx >= start_idx or is_classifier_parameter(name) or is_final_projection_parameter(name):
                 param.requires_grad = True
-        print(f"  [Unfreeze: {unfreeze_ratio}] Last {fraction:.0%} of parameters + classifier/head")
+        print(f"  [Unfreeze: {unfreeze_ratio}] Last {fraction:.0%} of parameters + final projection + classifier/head")
     
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
@@ -855,14 +882,16 @@ def stage2_personalize(base_model, train_data, val_data, personal_data, device,
     """
     start_time = time.time()
     
-    if classifier_only:
+    if classifier_only or unfreeze_ratio == 'classifier_head_only':
         mode = "Classifier Only"
-    elif unfreeze_ratio == 'third':
+    elif unfreeze_ratio in {'third', 'last_two_blocks_plus_head'}:
         mode = "Unfreeze 1/3 (blocks.5, 6)"
-    elif unfreeze_ratio == 'half':
+    elif unfreeze_ratio in {'half', 'upper_half_backbone_plus_head'}:
         mode = "Unfreeze 2/3 (blocks.3-6)"
-    else:
+    elif unfreeze_ratio in {'full', 'full_network'}:
         mode = "Full Layers"
+    else:
+        mode = unfreeze_ratio
     print(f"\n[Stage 2] Personalization ({mode})...")
     
     if train_source == 'base_plus_personal':
@@ -889,15 +918,13 @@ def stage2_personalize(base_model, train_data, val_data, personal_data, device,
     
     model = base_model.to(device)
     
-    if classifier_only:
-        # Freeze backbone, train only classifier
-        for param in model.parameters():
-            param.requires_grad = False
-        classifier_params = get_classifier_parameters(model)
-        for param in classifier_params:
-            param.requires_grad = True
-        optimizer = optim.Adam(classifier_params, lr=lr)
-    elif unfreeze_ratio in ['third', 'half']:
+    if classifier_only or unfreeze_ratio == 'classifier_head_only':
+        # For EfficientNet, this intentionally includes conv_head and bn2
+        # with the classifier/head to match the ABCD partial-unfreeze protocol.
+        model = setup_partial_unfreeze(model, unfreeze_ratio='classifier_head_only')
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = optim.Adam(trainable_params, lr=lr)
+    elif unfreeze_ratio in ['third', 'half', 'last_two_blocks_plus_head', 'upper_half_backbone_plus_head']:
         # Train only partial layers based on ratio
         model = setup_partial_unfreeze(model, unfreeze_ratio=unfreeze_ratio)
         trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -1024,6 +1051,1463 @@ def add_metric_row(metric_rows, model_name, leave_out_user, condition, result, s
         'missing_balanced_emotions': ','.join(ID_TO_EMOTION[label] for label in splits['missing_balanced_labels']),
         'stage2_train_source': '',
     })
+
+
+ABCD_LAYER_MODES = [
+    ('classifier_head_only', 'Classifier Head Only'),
+    ('last_two_blocks_plus_head', 'Last Two EfficientNet Blocks Plus Head'),
+    ('upper_half_backbone_plus_head', 'Upper Half Backbone Plus Head'),
+    ('full_network', 'Full Network'),
+]
+
+ABCD_C_SHOTS = [7, 14]
+
+ABCD_CONDITION_FULL_NAMES = {
+    'A_base': 'Subject-Independent Base Facial Emotion Recognition Model Without Personalization',
+    'B_film7': 'Joint Identity-Emotion Embedding With FiLM-Based User-Profile Conditioning Using 7 Enrollment Images',
+    'B_film14': 'Joint Identity-Emotion Embedding With FiLM-Based User-Profile Conditioning Using 14 Enrollment Images',
+    'B_proto7': 'Joint Identity-Emotion Embedding With Emotion Prototype User Profile Without Held-Out-User Fine-Tuning Using 7 Enrollment Images',
+    'B_proto14': 'Joint Identity-Emotion Embedding With Emotion Prototype User Profile Without Held-Out-User Fine-Tuning Using 14 Enrollment Images',
+    'D_manyshot_upper_half_backbone_plus_head': 'Many-Shot User-Specific Fine-Tuning Upper Reference With Upper Half Backbone Plus Head',
+    'D_manyshot_full_network': 'Many-Shot User-Specific Fine-Tuning Upper Reference With Full Network',
+    'D_scratch_upper_reference': 'Many-Shot Retraining From Scratch Upper Reference',
+}
+
+ABCD_FOLD_FIELDS = [
+    'Model Name',
+    'Experiment Family Full Name',
+    'Condition Full Name',
+    'User Profile Method Full Name',
+    'Enrollment Image Count',
+    'Enrollment Image Selection Full Name',
+    'Fine-Tuning Strategy Full Name',
+    'Layer-Freezing Strategy Full Name',
+    'Held-Out User ID',
+    'Common Test Image Count',
+    'Enrollment Image Count Actually Used',
+    'Missing Enrollment Emotion Names',
+    'Replacement Policy Full Name',
+    'Accuracy',
+    'Macro F1 Score',
+    'Non-Neutral Accuracy',
+    'Non-Neutral Macro F1 Score',
+    'Win Tie Loss Compared With Subject-Independent Base',
+    'Accuracy Difference From Base Percentage Points',
+    'Macro F1 Difference From Base Percentage Points',
+    'Base Model Training Time Seconds',
+    'Joint Identity Emotion Embedding Training Time Seconds',
+    'User Profile Construction Time Seconds',
+    'FiLM Conditioning Training Time Seconds',
+    'Fine-Tuning Time Seconds',
+    'Total Training Or Adaptation Time Seconds',
+    'Mean Inference Time Per Image Milliseconds',
+    'Trainable Parameter Count',
+    'Total Parameter Count',
+    'Run Status Full Name',
+    'Completed Timestamp',
+    'Result Checkpoint Or Resume Source',
+]
+
+ABCD_SUMMARY_FIELDS = [
+    'Model Name',
+    'Experiment Family Full Name',
+    'Condition Full Name',
+    'Mean Accuracy',
+    'Accuracy Standard Deviation',
+    'Mean Macro F1 Score',
+    'Macro F1 Score Standard Deviation',
+    'Mean Non-Neutral Accuracy',
+    'Mean Non-Neutral Macro F1 Score',
+    'Mean Accuracy Difference From Base Percentage Points',
+    'Mean Macro F1 Difference From Base Percentage Points',
+    'Users Improved Compared With Base',
+    'Users Tied Compared With Base',
+    'Users Worse Compared With Base',
+    'Mean Total Training Or Adaptation Time Seconds',
+    'Mean Joint Identity Emotion Embedding Training Time Seconds',
+    'Mean User Profile Construction Time Seconds',
+    'Mean Fine-Tuning Time Seconds',
+    'Mean Inference Time Per Image Milliseconds',
+    'Strict Complete-Emotion User Count',
+    'All User Count',
+]
+
+ABCD_MANIFEST_FIELDS = [
+    'Held-Out User ID',
+    'Split Role Full Name',
+    'Experiment Family Full Name',
+    'Condition Full Name',
+    'Enrollment Image Count',
+    'Target Emotion Name',
+    'Actual Emotion Name',
+    'Camera Index',
+    'Capture Key',
+    'Original Dataset Split Name',
+    'Selection Note Full Name',
+    'Replacement For Missing Emotion Name',
+    'Filename',
+    'Path',
+]
+
+ABCD_PER_EMOTION_FIELDS = [
+    'Model Name',
+    'Held-Out User ID',
+    'Experiment Family Full Name',
+    'Condition Full Name',
+    'Emotion Name',
+    'Precision',
+    'Recall',
+    'F1 Score',
+    'Support Count',
+]
+
+
+def abcd_c_condition_key(shots, mode_key):
+    return f'C_finetune{shots}_{mode_key}'
+
+
+def abcd_c_condition_full_name(shots, mode_full_name):
+    return f'Few-Shot User-Specific Fine-Tuning Using {shots} Enrollment Images With {mode_full_name}'
+
+
+def abcd_condition_full_name(condition_key):
+    if condition_key in ABCD_CONDITION_FULL_NAMES:
+        return ABCD_CONDITION_FULL_NAMES[condition_key]
+    for shots in ABCD_C_SHOTS:
+        prefix = f'C_finetune{shots}_'
+        if condition_key.startswith(prefix):
+            mode_key = condition_key[len(prefix):]
+            mode_name = dict(ABCD_LAYER_MODES).get(mode_key, mode_key)
+            return abcd_c_condition_full_name(shots, mode_name)
+    return condition_key
+
+
+def abcd_family_full_name(condition_key):
+    if condition_key.startswith('A_'):
+        return 'A: Subject-Independent Base Facial Emotion Recognition'
+    if condition_key.startswith('B_film'):
+        return 'B: User-Profile Conditioning With Joint Identity-Emotion Embedding And FiLM'
+    if condition_key.startswith('B_proto'):
+        return 'B: Joint Identity-Emotion Embedding With Emotion Prototype User Profile'
+    if condition_key.startswith('C_'):
+        return 'C: Few-Shot User-Specific Fine-Tuning'
+    if condition_key.startswith('D_'):
+        return 'D: Many-Shot Upper Reference'
+    return 'Unknown Experiment Family'
+
+
+def abcd_profile_method_full_name(condition_key):
+    if condition_key.startswith('B_film'):
+        return 'Joint Identity-Emotion Embedding With FiLM-Based Conditioning'
+    if condition_key.startswith('B_proto'):
+        return 'Joint Identity-Emotion Embedding With Emotion Prototype Matching'
+    return 'Not Applicable'
+
+
+def abcd_finetuning_strategy_full_name(condition_key):
+    if condition_key.startswith('C_'):
+        return 'Few-Shot User-Specific Fine-Tuning With Population Data Rehearsal'
+    if condition_key.startswith('D_manyshot'):
+        return 'Many-Shot User-Specific Fine-Tuning With Population Data Rehearsal'
+    if condition_key == 'D_scratch_upper_reference':
+        return 'Retraining From Scratch With Population And Held-Out User Support Data'
+    return 'Not Applicable'
+
+
+def abcd_layer_strategy_full_name(condition_key):
+    if condition_key == 'D_scratch_upper_reference':
+        return 'All Layers Trained From Randomly Initialized Classification Head'
+    mode_map = dict(ABCD_LAYER_MODES)
+    if condition_key.startswith('C_'):
+        mode_key = condition_key.split('_', 2)[2]
+        return mode_map.get(mode_key, mode_key)
+    if condition_key == 'D_manyshot_upper_half_backbone_plus_head':
+        return 'Upper Half Backbone Plus Head'
+    if condition_key == 'D_manyshot_full_network':
+        return 'Full Network'
+    return 'Not Applicable'
+
+
+def abcd_enrollment_count(condition_key):
+    for shots in (7, 14):
+        if str(shots) in condition_key and (condition_key.startswith('B_') or condition_key.startswith('C_')):
+            return shots
+    if condition_key.startswith('D_'):
+        return 'Many-Shot'
+    return 0
+
+
+def abcd_enrollment_selection_full_name(condition_key):
+    if '7' in condition_key and (condition_key.startswith('B_') or condition_key.startswith('C_')):
+        return 'One Labeled Enrollment Image Per Emotion From Held-Out User Support Pool'
+    if '14' in condition_key and (condition_key.startswith('B_') or condition_key.startswith('C_')):
+        return 'One Central And Side Camera Enrollment Pair Per Emotion From Held-Out User Support Pool'
+    if condition_key.startswith('D_'):
+        return 'All Non-Test Held-Out User Images From The Common 80 Percent Support Pool'
+    return 'No Held-Out User Enrollment Images'
+
+
+def trainable_parameter_counts(model):
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    return trainable, total
+
+
+def current_timestamp():
+    return datetime.now().isoformat(timespec='seconds')
+
+
+def read_csv_rows(path):
+    if not path.exists():
+        return []
+    with open(path, newline='') as csvfile:
+        return list(csv.DictReader(csvfile))
+
+
+def write_json(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'w') as f:
+        json.dump(payload, f, indent=2)
+
+
+def read_json(path, default):
+    if not path.exists():
+        return default
+    with open(path) as f:
+        return json.load(f)
+
+
+def split_common_test_records(personal_records, test_ratio=0.2, seed=42):
+    """Select an approximately 20% user-level common test holdout by capture group."""
+    rng = random.Random(seed)
+    groups_by_label = defaultdict(list)
+    grouped = defaultdict(list)
+    for record in personal_records:
+        grouped[record['capture_key']].append(record)
+    for group in grouped.values():
+        label_counts = Counter(record['label'] for record in group)
+        label = label_counts.most_common(1)[0][0]
+        groups_by_label[label].append(group)
+
+    test_paths = set()
+    for label in range(len(EMOTIONS)):
+        groups = list(groups_by_label.get(label, []))
+        rng.shuffle(groups)
+        if len(groups) <= 1:
+            continue
+        n_test_groups = max(1, int(round(len(groups) * test_ratio)))
+        for group in groups[:n_test_groups]:
+            for record in group:
+                test_paths.add(record['path'])
+
+    if not test_paths and personal_records:
+        fallback = list(grouped.values())
+        rng.shuffle(fallback)
+        for record in fallback[0]:
+            test_paths.add(record['path'])
+
+    test_records = [record for record in personal_records if record['path'] in test_paths]
+    support_records = [record for record in personal_records if record['path'] not in test_paths]
+    return support_records, test_records
+
+
+def select_abcd_enrollment_records(support_records, shots, seed=42, replacement_policy='keep_14',
+                                   allow_partial=False):
+    """Select 7 or 14 emotion-aware enrollment images and retain target labels for profiles."""
+    if shots not in {7, 14}:
+        raise ValueError(f"ABCD enrollment supports 7 or 14 shots, got {shots}")
+    rng = random.Random(seed)
+    selected_items = []
+    manifest = []
+    missing_labels = []
+    selected_paths = set()
+
+    def add_item(record, target_label, selection_note, replacement_for=''):
+        selected_paths.add(record['path'])
+        selected_items.append({
+            'record': record,
+            'target_label': target_label,
+            'target_emotion': ID_TO_EMOTION[target_label],
+            'selection_note': selection_note,
+            'replacement_for_emotion': replacement_for,
+        })
+        manifest.append({
+            **manifest_row(record, f'abcd_balanced{shots}'),
+            'target_label': target_label,
+            'target_emotion': ID_TO_EMOTION[target_label],
+            'selection_note': selection_note,
+            'replacement_for_emotion': replacement_for,
+        })
+
+    for label in range(len(EMOTIONS)):
+        if shots == 14:
+            pairs = paired_captures(support_records, label=label, excluded_paths=selected_paths)
+            rng.shuffle(pairs)
+            if not pairs:
+                missing_labels.append(label)
+                continue
+            _, pair_records = pairs[0]
+            for record in sorted(pair_records, key=lambda r: r['camera_index']):
+                add_item(record, label, 'emotion_camera_pair')
+        else:
+            candidates = [
+                record for record in support_records
+                if record['label'] == label and record['path'] not in selected_paths
+            ]
+            candidates = sorted(candidates, key=lambda r: (r['camera_index'] != '0', r['capture_key']))
+            if not candidates:
+                missing_labels.append(label)
+                continue
+            add_item(candidates[0], label, 'one_image_per_emotion')
+
+    if missing_labels and replacement_policy == 'strict':
+        missing = ','.join(ID_TO_EMOTION[label] for label in missing_labels)
+        raise RuntimeError(f"Missing required emotions for balanced{shots}: {missing}")
+
+    if missing_labels and replacement_policy == 'keep_14':
+        for target_label in missing_labels:
+            replacement_records = []
+            fallback_priority = SIMILAR_EMOTION_FALLBACKS.get(target_label, []) + [
+                label for label in range(len(EMOTIONS))
+                if label != target_label and label not in SIMILAR_EMOTION_FALLBACKS.get(target_label, [])
+            ]
+            for fallback_label in fallback_priority:
+                if shots == 14:
+                    pairs = paired_captures(support_records, label=fallback_label, excluded_paths=selected_paths)
+                    rng.shuffle(pairs)
+                    if pairs:
+                        replacement_records = sorted(pairs[0][1], key=lambda r: r['camera_index'])
+                        break
+                else:
+                    candidates = [
+                        record for record in support_records
+                        if record['label'] == fallback_label and record['path'] not in selected_paths
+                    ]
+                    candidates = sorted(candidates, key=lambda r: (r['camera_index'] != '0', r['capture_key']))
+                    if candidates:
+                        replacement_records = [candidates[0]]
+                        break
+            for record in replacement_records:
+                if len(selected_items) >= shots:
+                    break
+                add_item(record, target_label, 'similar_emotion_replacement', ID_TO_EMOTION[target_label])
+
+    if len(selected_items) < shots and not allow_partial:
+        raise RuntimeError(f"Only found {len(selected_items)} records for balanced{shots}")
+    return selected_items[:shots], manifest[:shots], missing_labels
+
+
+def create_abcd_splits(user_records, leave_out_user, seed=42, test_ratio=0.2,
+                       balanced_replacement_policy='keep_14'):
+    """Create fresh ABCD splits with a common 20% held-out-user test set."""
+    all_users = [u for u in user_records.keys() if u != str(leave_out_user)]
+    rng = random.Random(seed)
+    rng.shuffle(all_users)
+
+    train_users = set(all_users[:28])
+    val_users = set(all_users[28:36])
+    train_records, val_records, personal_records = [], [], []
+    for user_id, records in user_records.items():
+        if user_id == str(leave_out_user):
+            personal_records.extend(records)
+        elif user_id in train_users:
+            train_records.extend(records)
+        elif user_id in val_users:
+            val_records.extend(records)
+
+    support_records, common_test_records = split_common_test_records(personal_records, test_ratio, seed)
+    val_records_balanced = balance_records(val_records, seed)
+    enrollment_items = {}
+    enrollment_manifests = {}
+    missing_by_shots = {}
+    for shots in ABCD_C_SHOTS:
+        items, manifest, missing = select_abcd_enrollment_records(
+            support_records, shots=shots, seed=seed, replacement_policy=balanced_replacement_policy
+        )
+        enrollment_items[shots] = items
+        enrollment_manifests[shots] = manifest
+        missing_by_shots[shots] = missing
+
+    other_emotion_test_records = [record for record in common_test_records if record['label'] != NEUTRAL_LABEL]
+    return {
+        'train': records_to_data(train_records),
+        'val': records_to_data(val_records_balanced),
+        'test_common': records_to_data(common_test_records),
+        'test_other': records_to_data(other_emotion_test_records),
+        'support': records_to_data(support_records),
+        'enrollment_items': enrollment_items,
+        'enrollment_manifests': enrollment_manifests,
+        'missing_by_shots': missing_by_shots,
+        'train_records': train_records,
+        'val_records': val_records_balanced,
+        'support_records': support_records,
+        'test_records': common_test_records,
+        'train_user_ids': sorted(train_users, key=numeric_sort_key),
+        'val_user_ids': sorted(val_users, key=numeric_sort_key),
+        'train_users': len(train_users),
+        'val_users': len(val_users),
+        'personal_total': len(personal_records),
+        'personal_support': len(support_records),
+        'personal_test': len(common_test_records),
+    }
+
+
+class RecordIndexDataset(Dataset):
+    def __init__(self, records, transform=None):
+        self.records = list(records)
+        self.transform = transform or val_transform
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, idx):
+        record = self.records[idx]
+        image = Image.open(record['path']).convert('RGB')
+        if self.transform:
+            image = self.transform(image)
+        return image, idx
+
+
+def create_feature_extractor(model_name, state_dict, device):
+    model = create_model(model_name=model_name).to(device)
+    model.load_state_dict(state_dict)
+    if not hasattr(model, 'reset_classifier'):
+        raise RuntimeError(f"{model_name} does not support reset_classifier for feature extraction")
+    model.reset_classifier(0)
+    for param in model.parameters():
+        param.requires_grad = False
+    model.eval()
+    return model
+
+
+def flatten_model_features(features):
+    if isinstance(features, (tuple, list)):
+        features = features[0]
+    if features.ndim > 2:
+        features = torch.flatten(torch.nn.functional.adaptive_avg_pool2d(features, 1), 1)
+    return features
+
+
+def extract_feature_map(feature_model, records, device, batch_size=64, num_workers=0):
+    unique_records = []
+    seen = set()
+    for record in records:
+        if record['path'] not in seen:
+            unique_records.append(record)
+            seen.add(record['path'])
+    loader = make_data_loader(
+        RecordIndexDataset(unique_records, transform=val_transform),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        persistent_workers=False,
+    )
+    feature_map = {}
+    feature_dim = None
+    feature_model.eval()
+    with torch.no_grad():
+        for images, indices in loader:
+            images = images.to(device)
+            features = flatten_model_features(feature_model(images))
+            features = torch.nn.functional.normalize(features, p=2, dim=1)
+            if feature_dim is None:
+                feature_dim = int(features.shape[1])
+            for idx, feature in zip(indices.numpy().tolist(), features.cpu().numpy()):
+                feature_map[unique_records[idx]['path']] = feature.astype(np.float32)
+    return feature_map, feature_dim or 0
+
+
+def build_profile_vector(enrollment_items, feature_map, feature_dim):
+    profile = np.zeros((len(EMOTIONS), feature_dim), dtype=np.float32)
+    counts = np.zeros(len(EMOTIONS), dtype=np.float32)
+    for item in enrollment_items:
+        feature = feature_map[item['record']['path']]
+        label = int(item['target_label'])
+        profile[label] += feature
+        counts[label] += 1
+    for label in range(len(EMOTIONS)):
+        if counts[label] > 0:
+            profile[label] /= counts[label]
+            norm = np.linalg.norm(profile[label])
+            if norm > 0:
+                profile[label] /= norm
+    return profile.reshape(-1)
+
+
+def build_user_profiles(records, shots, feature_map, feature_dim, seed=42,
+                        replacement_policy='keep_14', allow_partial=False):
+    profiles = {}
+    selected_paths = set()
+    manifests = []
+    grouped = records_by_user(records)
+    for user_id, user_records in grouped.items():
+        items, manifest, _ = select_abcd_enrollment_records(
+            user_records, shots=shots, seed=seed + int(user_id),
+            replacement_policy=replacement_policy, allow_partial=allow_partial
+        )
+        profiles[user_id] = build_profile_vector(items, feature_map, feature_dim)
+        selected_paths.update(item['record']['path'] for item in items)
+        manifests.extend(manifest)
+    return profiles, selected_paths, manifests
+
+
+class FeatureEmotionDataset(Dataset):
+    def __init__(self, records, feature_map):
+        self.records = list(records)
+        self.feature_map = feature_map
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, idx):
+        record = self.records[idx]
+        return (
+            torch.tensor(self.feature_map[record['path']], dtype=torch.float32),
+            int(record['label']),
+        )
+
+
+class FeatureIdentityEmotionDataset(Dataset):
+    def __init__(self, records, feature_map, user_to_identity_label):
+        self.records = [
+            record for record in records
+            if record['user_id'] in user_to_identity_label and record['path'] in feature_map
+        ]
+        self.feature_map = feature_map
+        self.user_to_identity_label = user_to_identity_label
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, idx):
+        record = self.records[idx]
+        return (
+            torch.tensor(self.feature_map[record['path']], dtype=torch.float32),
+            int(record['label']),
+            int(self.user_to_identity_label[record['user_id']]),
+        )
+
+
+class JointIdentityEmotionEmbeddingHead(nn.Module):
+    def __init__(self, input_dim, embedding_dim=512, num_identity_classes=1, num_emotion_classes=7):
+        super().__init__()
+        self.projector = nn.Sequential(
+            nn.Linear(input_dim, embedding_dim),
+            nn.LayerNorm(embedding_dim),
+            nn.ReLU(),
+        )
+        self.emotion_head = nn.Linear(embedding_dim, num_emotion_classes)
+        self.identity_head = nn.Linear(embedding_dim, num_identity_classes)
+
+    def embed(self, features):
+        embedding = self.projector(features)
+        return torch.nn.functional.normalize(embedding, p=2, dim=1)
+
+    def forward(self, features):
+        embedding = self.embed(features)
+        return embedding, self.emotion_head(embedding), self.identity_head(embedding)
+
+
+def train_joint_identity_emotion_embedder(train_records, val_records, base_feature_map, input_dim, device,
+                                          embedding_dim=512, identity_loss_weight=1.0,
+                                          epochs=50, patience=10, batch_size=64, lr=1e-4):
+    """Train a lightweight joint identity-emotion projection on frozen FER features."""
+    start_time = time.time()
+    train_user_ids = sorted({record['user_id'] for record in train_records}, key=numeric_sort_key)
+    user_to_identity_label = {user_id: idx for idx, user_id in enumerate(train_user_ids)}
+    if not train_user_ids:
+        raise RuntimeError("Cannot train joint identity-emotion embedding without training users")
+
+    train_dataset = FeatureIdentityEmotionDataset(train_records, base_feature_map, user_to_identity_label)
+    val_dataset = FeatureEmotionDataset(val_records, base_feature_map)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+
+    model = JointIdentityEmotionEmbeddingHead(
+        input_dim=input_dim,
+        embedding_dim=embedding_dim,
+        num_identity_classes=len(train_user_ids),
+        num_emotion_classes=len(EMOTIONS),
+    ).to(device)
+    emotion_labels = [record['label'] for record in train_dataset.records]
+    emotion_criterion = nn.CrossEntropyLoss(weight=calculate_class_weights(emotion_labels, device))
+    identity_criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    best_state = None
+    best_val_acc = 0
+    patience_counter = 0
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0.0
+        train_labels, train_preds = [], []
+        identity_labels, identity_preds = [], []
+        for features, emotions, identities in train_loader:
+            features = features.to(device)
+            emotions = emotions.to(device)
+            identities = identities.to(device)
+            optimizer.zero_grad()
+            _, emotion_logits, identity_logits = model(features)
+            loss = (
+                emotion_criterion(emotion_logits, emotions)
+                + identity_loss_weight * identity_criterion(identity_logits, identities)
+            )
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * features.size(0)
+            train_preds.extend(emotion_logits.argmax(dim=1).detach().cpu().numpy())
+            train_labels.extend(emotions.detach().cpu().numpy())
+            identity_preds.extend(identity_logits.argmax(dim=1).detach().cpu().numpy())
+            identity_labels.extend(identities.detach().cpu().numpy())
+
+        model.eval()
+        val_labels, val_preds = [], []
+        with torch.no_grad():
+            for features, emotions in val_loader:
+                features = features.to(device)
+                _, emotion_logits, _ = model(features)
+                val_preds.extend(emotion_logits.argmax(dim=1).cpu().numpy())
+                val_labels.extend(emotions.numpy())
+        val_acc = accuracy_score(val_labels, val_preds) if val_labels else 0
+        train_acc = accuracy_score(train_labels, train_preds) if train_labels else 0
+        identity_acc = accuracy_score(identity_labels, identity_preds) if identity_labels else 0
+        avg_loss = total_loss / max(1, len(train_dataset))
+        print(
+            f"  Joint Embedding Epoch {epoch+1}: "
+            f"Loss={avg_loss:.4f}, Emotion Train Acc={train_acc:.4f}, "
+            f"Identity Train Acc={identity_acc:.4f}, Emotion Val Acc={val_acc:.4f}"
+        )
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_state = {key: value.cpu().clone() for key, value in model.state_dict().items()}
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"  [Joint Embedding Early Stopping] at epoch {epoch+1}")
+                break
+
+    if best_state:
+        model.load_state_dict(best_state)
+    return model, time.time() - start_time, {
+        'input_dim': input_dim,
+        'embedding_dim': embedding_dim,
+        'num_identity_classes': len(train_user_ids),
+        'identity_loss_weight': identity_loss_weight,
+        'best_val_emotion_acc': best_val_acc,
+    }
+
+
+def extract_joint_embedding_map(joint_model, base_feature_map, records, device, batch_size=256):
+    unique_records = []
+    seen = set()
+    for record in records:
+        if record['path'] not in seen:
+            unique_records.append(record)
+            seen.add(record['path'])
+    loader = DataLoader(FeatureEmotionDataset(unique_records, base_feature_map), batch_size=batch_size, shuffle=False)
+    joint_map = {}
+    embedding_dim = None
+    joint_model.eval()
+    with torch.no_grad():
+        offset = 0
+        for features, _ in loader:
+            features = features.to(device)
+            embeddings = joint_model.embed(features)
+            if embedding_dim is None:
+                embedding_dim = int(embeddings.shape[1])
+            for record, embedding in zip(unique_records[offset:offset + len(features)], embeddings.cpu().numpy()):
+                joint_map[record['path']] = embedding.astype(np.float32)
+            offset += len(features)
+    return joint_map, embedding_dim or 0
+
+
+class FeatureProfileDataset(Dataset):
+    def __init__(self, records, feature_map, profiles):
+        self.records = list(records)
+        self.feature_map = feature_map
+        self.profiles = profiles
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, idx):
+        record = self.records[idx]
+        return (
+            torch.tensor(self.feature_map[record['path']], dtype=torch.float32),
+            torch.tensor(self.profiles[record['user_id']], dtype=torch.float32),
+            int(record['label']),
+        )
+
+
+class FiLMFeatureClassifier(nn.Module):
+    def __init__(self, feature_dim, profile_dim, num_classes=7):
+        super().__init__()
+        hidden_dim = max(128, min(512, profile_dim // 4))
+        self.modulator = nn.Sequential(
+            nn.Linear(profile_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, feature_dim * 2),
+        )
+        self.classifier = nn.Linear(feature_dim, num_classes)
+
+    def forward(self, features, profiles):
+        gamma_beta = self.modulator(profiles)
+        gamma, beta = torch.chunk(gamma_beta, 2, dim=1)
+        conditioned = features * (1.0 + gamma) + beta
+        return self.classifier(conditioned)
+
+
+def train_film_conditioner(train_records, val_records, feature_map, train_profiles, val_profiles,
+                           feature_dim, profile_dim, device, epochs=50, patience=10,
+                           batch_size=64, lr=1e-4):
+    start_time = time.time()
+    train_dataset = FeatureProfileDataset(train_records, feature_map, train_profiles)
+    val_dataset = FeatureProfileDataset(val_records, feature_map, val_profiles)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    model = FiLMFeatureClassifier(feature_dim, profile_dim).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    best_state = None
+    best_val_acc = 0
+    patience_counter = 0
+    for epoch in range(epochs):
+        model.train()
+        for features, profiles, labels in train_loader:
+            features = features.to(device)
+            profiles = profiles.to(device)
+            labels = labels.to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(features, profiles), labels)
+            loss.backward()
+            optimizer.step()
+        model.eval()
+        val_labels, val_preds = [], []
+        with torch.no_grad():
+            for features, profiles, labels in val_loader:
+                features = features.to(device)
+                profiles = profiles.to(device)
+                logits = model(features, profiles)
+                val_preds.extend(logits.argmax(dim=1).cpu().numpy())
+                val_labels.extend(labels.numpy())
+        val_acc = accuracy_score(val_labels, val_preds) if val_labels else 0
+        print(f"  FiLM Epoch {epoch+1}: Val Acc={val_acc:.4f}")
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_state = {key: value.cpu().clone() for key, value in model.state_dict().items()}
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"  [FiLM Early Stopping] at epoch {epoch+1}")
+                break
+    if best_state:
+        model.load_state_dict(best_state)
+    return model, time.time() - start_time
+
+
+def prediction_metrics(labels, preds, elapsed_sec=0):
+    labels = list(labels)
+    preds = list(preds)
+    if not labels:
+        return {
+            'accuracy': 0,
+            'f1': 0,
+            'n_samples': 0,
+            'other_accuracy': 0,
+            'other_f1': 0,
+            'other_n_samples': 0,
+            'confusion_matrix': [],
+            'per_emotion': [],
+            'mean_inference_time_ms': 0,
+        }
+    cm = confusion_matrix(labels, preds, labels=list(range(len(EMOTIONS))))
+    precision, recall, f1_values, support = precision_recall_fscore_support(
+        labels, preds, labels=list(range(len(EMOTIONS))), zero_division=0
+    )
+    other = [(label, pred) for label, pred in zip(labels, preds) if label != NEUTRAL_LABEL]
+    if other:
+        other_labels, other_preds = zip(*other)
+        other_accuracy = accuracy_score(other_labels, other_preds)
+        other_f1 = f1_score(
+            other_labels, other_preds, average='macro',
+            labels=[label for label in range(len(EMOTIONS)) if label != NEUTRAL_LABEL],
+            zero_division=0,
+        )
+    else:
+        other_accuracy, other_f1 = 0, 0
+    return {
+        'accuracy': accuracy_score(labels, preds),
+        'f1': f1_score(labels, preds, average='macro', labels=list(range(len(EMOTIONS))), zero_division=0),
+        'n_samples': len(labels),
+        'other_accuracy': other_accuracy,
+        'other_f1': other_f1,
+        'other_n_samples': len(other),
+        'confusion_matrix': cm.tolist(),
+        'per_emotion': [
+            {
+                'emotion': ID_TO_EMOTION[label],
+                'precision': float(precision[label]),
+                'recall': float(recall[label]),
+                'f1': float(f1_values[label]),
+                'support': int(support[label]),
+            }
+            for label in range(len(EMOTIONS))
+        ],
+        'mean_inference_time_ms': (elapsed_sec / len(labels) * 1000.0) if labels else 0,
+    }
+
+
+def evaluate_model_detailed(model, test_data, device, batch_size=32):
+    if len(test_data['images']) == 0:
+        return prediction_metrics([], [])
+    dataset = EmojiHeroDataset(test_data['images'], test_data['labels'], transform=val_transform)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    model.eval()
+    labels_all, preds_all = [], []
+    start = time.time()
+    with torch.no_grad():
+        for images, labels in loader:
+            images = images.to(device)
+            outputs = model(images)
+            preds_all.extend(outputs.argmax(dim=1).cpu().numpy())
+            labels_all.extend(labels.numpy())
+    return prediction_metrics(labels_all, preds_all, time.time() - start)
+
+
+def evaluate_film_model(film_model, feature_map, profile_vector, test_records, device):
+    labels, preds = [], []
+    profile = torch.tensor(profile_vector, dtype=torch.float32, device=device).unsqueeze(0)
+    start = time.time()
+    film_model.eval()
+    with torch.no_grad():
+        for record in test_records:
+            feature = torch.tensor(feature_map[record['path']], dtype=torch.float32, device=device).unsqueeze(0)
+            logits = film_model(feature, profile)
+            preds.append(int(logits.argmax(dim=1).item()))
+            labels.append(int(record['label']))
+    return prediction_metrics(labels, preds, time.time() - start)
+
+
+def evaluate_prototype_model(feature_map, profile_vector, feature_dim, test_records):
+    prototypes = profile_vector.reshape(len(EMOTIONS), feature_dim)
+    labels, preds = [], []
+    start = time.time()
+    for record in test_records:
+        feature = feature_map[record['path']]
+        scores = prototypes @ feature
+        preds.append(int(np.argmax(scores)))
+        labels.append(int(record['label']))
+    return prediction_metrics(labels, preds, time.time() - start)
+
+
+def abcd_result_row(condition_key, heldout_user, result, splits, base_result=None,
+                    model_name='',
+                    enrollment_count=0, enrollment_used=0, missing_labels=None,
+                    replacement_policy='keep_14', base_time=0, profile_time=0,
+                    joint_embedding_time=0, film_time=0, finetune_time=0, trainable_params=0,
+                    total_params=0, checkpoint_source=''):
+    missing_labels = missing_labels or []
+    if base_result is None or condition_key == 'A_base':
+        win_tie_loss = 'Base Reference'
+        delta_acc = 0.0
+        delta_f1 = 0.0
+    else:
+        delta_acc = (result['accuracy'] - base_result['accuracy']) * 100.0
+        delta_f1 = (result['f1'] - base_result['f1']) * 100.0
+        if math.isclose(result['accuracy'], base_result['accuracy'], rel_tol=0, abs_tol=1e-12):
+            win_tie_loss = 'Tie Compared With Subject-Independent Base'
+        elif result['accuracy'] > base_result['accuracy']:
+            win_tie_loss = 'Win Compared With Subject-Independent Base'
+        else:
+            win_tie_loss = 'Loss Compared With Subject-Independent Base'
+    total_time = base_time + joint_embedding_time + profile_time + film_time + finetune_time
+    return {
+        'Model Name': model_name,
+        'Experiment Family Full Name': abcd_family_full_name(condition_key),
+        'Condition Full Name': abcd_condition_full_name(condition_key),
+        'User Profile Method Full Name': abcd_profile_method_full_name(condition_key),
+        'Enrollment Image Count': enrollment_count,
+        'Enrollment Image Selection Full Name': abcd_enrollment_selection_full_name(condition_key),
+        'Fine-Tuning Strategy Full Name': abcd_finetuning_strategy_full_name(condition_key),
+        'Layer-Freezing Strategy Full Name': abcd_layer_strategy_full_name(condition_key),
+        'Held-Out User ID': str(heldout_user),
+        'Common Test Image Count': result['n_samples'],
+        'Enrollment Image Count Actually Used': enrollment_used,
+        'Missing Enrollment Emotion Names': ', '.join(ID_TO_EMOTION[label] for label in missing_labels),
+        'Replacement Policy Full Name': (
+            'Keep Enrollment Count By Same-User Similar-Emotion Replacement'
+            if replacement_policy == 'keep_14' else 'Strict Complete Emotion Enrollment Only'
+        ),
+        'Accuracy': result['accuracy'],
+        'Macro F1 Score': result['f1'],
+        'Non-Neutral Accuracy': result['other_accuracy'],
+        'Non-Neutral Macro F1 Score': result['other_f1'],
+        'Win Tie Loss Compared With Subject-Independent Base': win_tie_loss,
+        'Accuracy Difference From Base Percentage Points': delta_acc,
+        'Macro F1 Difference From Base Percentage Points': delta_f1,
+        'Base Model Training Time Seconds': base_time,
+        'Joint Identity Emotion Embedding Training Time Seconds': joint_embedding_time,
+        'User Profile Construction Time Seconds': profile_time,
+        'FiLM Conditioning Training Time Seconds': film_time,
+        'Fine-Tuning Time Seconds': finetune_time,
+        'Total Training Or Adaptation Time Seconds': total_time,
+        'Mean Inference Time Per Image Milliseconds': result['mean_inference_time_ms'],
+        'Trainable Parameter Count': trainable_params,
+        'Total Parameter Count': total_params,
+        'Run Status Full Name': 'Completed',
+        'Completed Timestamp': current_timestamp(),
+        'Result Checkpoint Or Resume Source': checkpoint_source,
+    }
+
+
+def abcd_per_emotion_rows(condition_key, heldout_user, result, model_name=''):
+    rows = []
+    for item in result['per_emotion']:
+        rows.append({
+            'Model Name': model_name,
+            'Held-Out User ID': str(heldout_user),
+            'Experiment Family Full Name': abcd_family_full_name(condition_key),
+            'Condition Full Name': abcd_condition_full_name(condition_key),
+            'Emotion Name': item['emotion'],
+            'Precision': item['precision'],
+            'Recall': item['recall'],
+            'F1 Score': item['f1'],
+            'Support Count': item['support'],
+        })
+    return rows
+
+
+def abcd_manifest_rows_for_split(heldout_user, splits, model_condition='All Conditions'):
+    rows = []
+    for record in splits['test_records']:
+        rows.append({
+            'Held-Out User ID': str(heldout_user),
+            'Split Role Full Name': 'Common Test Holdout Image',
+            'Experiment Family Full Name': 'All ABCD Experiment Families',
+            'Condition Full Name': model_condition,
+            'Enrollment Image Count': 0,
+            'Target Emotion Name': record['emotion'],
+            'Actual Emotion Name': record['emotion'],
+            'Camera Index': record['camera_index'],
+            'Capture Key': record['capture_key'],
+            'Original Dataset Split Name': record.get('original_set', ''),
+            'Selection Note Full Name': 'Selected For Common 20 Percent Held-Out User Test Set',
+            'Replacement For Missing Emotion Name': '',
+            'Filename': record['filename'],
+            'Path': record['path'],
+        })
+    for shots, manifest in splits['enrollment_manifests'].items():
+        for row in manifest:
+            rows.append({
+                'Held-Out User ID': str(heldout_user),
+                'Split Role Full Name': f'{shots} Enrollment Image User Profile Or Fine-Tuning Support',
+                'Experiment Family Full Name': 'B And C Enrollment-Based Conditions',
+                'Condition Full Name': f'All {shots} Enrollment Image Conditions',
+                'Enrollment Image Count': shots,
+                'Target Emotion Name': row.get('target_emotion', row['emotion']),
+                'Actual Emotion Name': row['emotion'],
+                'Camera Index': row['camera_index'],
+                'Capture Key': row['capture_key'],
+                'Original Dataset Split Name': row.get('original_set', ''),
+                'Selection Note Full Name': row.get('selection_note', ''),
+                'Replacement For Missing Emotion Name': row.get('replacement_for_emotion', ''),
+                'Filename': row['filename'],
+                'Path': row['path'],
+            })
+    return rows
+
+
+def summarize_abcd_rows(fold_rows):
+    grouped = defaultdict(list)
+    for row in fold_rows:
+        grouped[(row.get('Model Name', ''), row['Condition Full Name'])].append(row)
+    summary_rows = []
+    for (model_name, condition_full_name), rows in grouped.items():
+        accuracies = [float(row['Accuracy']) for row in rows]
+        f1_values = [float(row['Macro F1 Score']) for row in rows]
+        other_acc = [float(row['Non-Neutral Accuracy']) for row in rows]
+        other_f1 = [float(row['Non-Neutral Macro F1 Score']) for row in rows]
+        delta_acc = [float(row['Accuracy Difference From Base Percentage Points']) for row in rows]
+        delta_f1 = [float(row['Macro F1 Difference From Base Percentage Points']) for row in rows]
+        total_times = [float(row['Total Training Or Adaptation Time Seconds']) for row in rows]
+        joint_times = [float(row.get('Joint Identity Emotion Embedding Training Time Seconds', 0) or 0) for row in rows]
+        profile_times = [float(row['User Profile Construction Time Seconds']) for row in rows]
+        finetune_times = [float(row['Fine-Tuning Time Seconds']) for row in rows]
+        inference_times = [float(row['Mean Inference Time Per Image Milliseconds']) for row in rows]
+        wins = sum(row['Win Tie Loss Compared With Subject-Independent Base'].startswith('Win') for row in rows)
+        ties = sum(row['Win Tie Loss Compared With Subject-Independent Base'].startswith('Tie') for row in rows)
+        losses = sum(row['Win Tie Loss Compared With Subject-Independent Base'].startswith('Loss') for row in rows)
+        strict_count = sum(not row['Missing Enrollment Emotion Names'] for row in rows)
+        summary_rows.append({
+            'Model Name': model_name,
+            'Experiment Family Full Name': rows[0]['Experiment Family Full Name'],
+            'Condition Full Name': condition_full_name,
+            'Mean Accuracy': float(np.mean(accuracies)),
+            'Accuracy Standard Deviation': float(np.std(accuracies)),
+            'Mean Macro F1 Score': float(np.mean(f1_values)),
+            'Macro F1 Score Standard Deviation': float(np.std(f1_values)),
+            'Mean Non-Neutral Accuracy': float(np.mean(other_acc)),
+            'Mean Non-Neutral Macro F1 Score': float(np.mean(other_f1)),
+            'Mean Accuracy Difference From Base Percentage Points': float(np.mean(delta_acc)),
+            'Mean Macro F1 Difference From Base Percentage Points': float(np.mean(delta_f1)),
+            'Users Improved Compared With Base': wins,
+            'Users Tied Compared With Base': ties,
+            'Users Worse Compared With Base': losses,
+            'Mean Total Training Or Adaptation Time Seconds': float(np.mean(total_times)),
+            'Mean Joint Identity Emotion Embedding Training Time Seconds': float(np.mean(joint_times)),
+            'Mean User Profile Construction Time Seconds': float(np.mean(profile_times)),
+            'Mean Fine-Tuning Time Seconds': float(np.mean(finetune_times)),
+            'Mean Inference Time Per Image Milliseconds': float(np.mean(inference_times)),
+            'Strict Complete-Emotion User Count': strict_count,
+            'All User Count': len(rows),
+        })
+    return sorted(summary_rows, key=lambda row: (row.get('Model Name', ''), row['Condition Full Name']))
+
+
+def flush_abcd_outputs(paths, fold_rows, per_emotion_rows, manifest_rows, confusion_payload, status):
+    write_csv_rows(paths['fold'], ABCD_FOLD_FIELDS, fold_rows)
+    write_csv_rows(paths['per_emotion'], ABCD_PER_EMOTION_FIELDS, per_emotion_rows)
+    write_csv_rows(paths['manifest'], ABCD_MANIFEST_FIELDS, manifest_rows)
+    write_csv_rows(paths['summary'], ABCD_SUMMARY_FIELDS, summarize_abcd_rows(fold_rows))
+    write_json(paths['confusion'], confusion_payload)
+    write_json(paths['status'], status)
+
+
+def abcd_is_complete(status, model_name, heldout_user, condition_key):
+    return condition_key in status.get('completed_conditions', {}).get(model_name, {}).get(str(heldout_user), [])
+
+
+def abcd_mark_complete(status, model_name, heldout_user, condition_key):
+    status.setdefault('completed_conditions', {}).setdefault(model_name, {}).setdefault(str(heldout_user), [])
+    completed = status['completed_conditions'][model_name][str(heldout_user)]
+    if condition_key not in completed:
+        completed.append(condition_key)
+
+
+def run_abcd(args):
+    seed = args.seed
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    data_dir = resolve_si_root(args.data_dir)
+    data_layout = infer_data_layout(data_dir) if args.data_layout == 'auto' else args.data_layout
+    records = collect_records(data_dir, data_layout)
+    user_records = records_by_user(records)
+    all_users = sorted(user_records.keys(), key=numeric_sort_key)
+    if args.user:
+        fold_users = [str(args.user)]
+    elif args.folds == 'all':
+        fold_users = all_users
+    else:
+        fold_users = parse_csv_option(args.folds)
+    if args.max_folds:
+        fold_users = fold_users[:args.max_folds]
+    model_names = parse_csv_option(args.models) or ['efficientnet_b0']
+    abcd_c_modes = parse_csv_option(args.abcd_c_modes)
+    if not abcd_c_modes:
+        selected_c_layer_modes = ABCD_LAYER_MODES
+    else:
+        layer_mode_names = dict(ABCD_LAYER_MODES)
+        unsupported = [mode for mode in abcd_c_modes if mode not in layer_mode_names]
+        if unsupported:
+            raise ValueError(
+                f"Unsupported ABCD C fine-tuning modes: {unsupported}. "
+                f"Supported: {list(layer_mode_names)}"
+            )
+        selected_c_layer_modes = [(mode, layer_mode_names[mode]) for mode in abcd_c_modes]
+
+    if args.abcd_resume_dir:
+        results_dir = Path(args.abcd_resume_dir)
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_name = args.run_name or 'abcd'
+        results_dir = Path(args.results_dir) / f"{run_name}_{timestamp}"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = results_dir / 'checkpoints'
+    checkpoint_dir.mkdir(exist_ok=True)
+    paths = {
+        'fold': results_dir / 'abcd_fold_level_results.csv',
+        'summary': results_dir / 'abcd_condition_summary.csv',
+        'manifest': results_dir / 'abcd_support_and_test_manifest.csv',
+        'per_emotion': results_dir / 'abcd_per_emotion_results.csv',
+        'confusion': results_dir / 'abcd_confusion_matrices.json',
+        'status': results_dir / 'abcd_run_status.json',
+        'config': results_dir / 'abcd_run_config.json',
+    }
+    config = {
+        'mode': 'abcd',
+        'data_dir': str(data_dir),
+        'data_layout': data_layout,
+        'models': model_names,
+        'fold_users': fold_users,
+        'common_test_holdout_ratio': args.abcd_test_ratio,
+        'replacement_policy': args.balanced_replacement_policy,
+        'c_finetuning_layer_modes': [mode_name for _, mode_name in selected_c_layer_modes],
+        'd_upper_reference_conditions': [
+            ABCD_CONDITION_FULL_NAMES['D_manyshot_upper_half_backbone_plus_head'],
+            ABCD_CONDITION_FULL_NAMES['D_manyshot_full_network'],
+            ABCD_CONDITION_FULL_NAMES['D_scratch_upper_reference'],
+        ],
+        'epochs': args.epochs,
+        'patience': args.patience,
+        'batch_size': args.batch_size,
+        'b_joint_embedding_dim': args.abcd_joint_embedding_dim,
+        'b_joint_embedding_learning_rate': args.abcd_joint_lr,
+        'b_joint_identity_loss_weight': args.abcd_joint_identity_loss_weight,
+        'seed': seed,
+    }
+    write_json(paths['config'], config)
+
+    fold_rows = read_csv_rows(paths['fold'])
+    per_emotion_rows = read_csv_rows(paths['per_emotion'])
+    manifest_rows = read_csv_rows(paths['manifest'])
+    confusion_payload = read_json(paths['confusion'], {})
+    status = read_json(paths['status'], {'completed_conditions': {}, 'run_dir': str(results_dir)})
+    status['run_dir'] = str(results_dir)
+
+    existing_manifest_users = {
+        (row['Held-Out User ID'], row['Condition Full Name']) for row in manifest_rows
+    }
+    for heldout_user in fold_users:
+        splits = create_abcd_splits(
+            user_records, heldout_user,
+            seed=seed + int(heldout_user) if str(heldout_user).isdigit() else seed,
+            test_ratio=args.abcd_test_ratio,
+            balanced_replacement_policy=args.balanced_replacement_policy,
+        )
+        if (str(heldout_user), 'All Conditions') not in existing_manifest_users:
+            manifest_rows.extend(abcd_manifest_rows_for_split(heldout_user, splits))
+            existing_manifest_users.add((str(heldout_user), 'All Conditions'))
+
+    if args.dry_run:
+        flush_abcd_outputs(paths, fold_rows, per_emotion_rows, manifest_rows, confusion_payload, status)
+        print(f"[Dry Run] ABCD manifests and config written to: {results_dir}")
+        return
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    mlruns_dir = PROJECT_DIR / "mlruns"
+    mlflow.set_tracking_uri(f"file:///{mlruns_dir.as_posix()}")
+    mlflow.set_experiment("loo_cv_abcd")
+
+    for model_name in model_names:
+        for heldout_user in fold_users:
+            print(f"\n{'='*80}")
+            print(f"ABCD: model={model_name}, held-out user={heldout_user}")
+            print(f"{'='*80}")
+            splits = create_abcd_splits(
+                user_records, heldout_user,
+                seed=seed + int(heldout_user) if str(heldout_user).isdigit() else seed,
+                test_ratio=args.abcd_test_ratio,
+                balanced_replacement_policy=args.balanced_replacement_policy,
+            )
+            base_ckpt = checkpoint_dir / f"{model_name}_user{heldout_user}_base.pt"
+            base_meta = checkpoint_dir / f"{model_name}_user{heldout_user}_base.json"
+
+            with mlflow.start_run(run_name=f"abcd_{model_name}_User_{heldout_user}"):
+                if base_ckpt.exists() and base_meta.exists():
+                    base_model = create_model(model_name=model_name).to(device)
+                    base_model.load_state_dict(torch.load(base_ckpt, map_location=device))
+                    base_time = read_json(base_meta, {}).get('stage1_time_sec', 0)
+                    print(f"Loaded base checkpoint: {base_ckpt}")
+                else:
+                    base_model, base_time = stage1_base_training(
+                        splits['train'], splits['val'], device,
+                        epochs=args.epochs, patience=args.patience,
+                        batch_size=args.batch_size, model_name=model_name,
+                        num_workers=args.num_workers,
+                        persistent_workers=not args.no_persistent_workers,
+                    )
+                    torch.save(base_model.state_dict(), base_ckpt)
+                    write_json(base_meta, {'stage1_time_sec': base_time, 'completed_at': current_timestamp()})
+
+                base_state = copy.deepcopy(base_model.state_dict())
+                base_result = None
+                if not abcd_is_complete(status, model_name, heldout_user, 'A_base'):
+                    result = evaluate_model_detailed(base_model, splits['test_common'], device, args.batch_size)
+                    trainable, total = trainable_parameter_counts(base_model)
+                    row = abcd_result_row(
+                        'A_base', heldout_user, result, splits, base_result=None,
+                        model_name=model_name,
+                        base_time=base_time, trainable_params=trainable, total_params=total,
+                        checkpoint_source=str(base_ckpt),
+                    )
+                    fold_rows.append(row)
+                    per_emotion_rows.extend(abcd_per_emotion_rows('A_base', heldout_user, result, model_name))
+                    confusion_payload.setdefault(model_name, {}).setdefault(str(heldout_user), {})[
+                        abcd_condition_full_name('A_base')
+                    ] = result['confusion_matrix']
+                    abcd_mark_complete(status, model_name, heldout_user, 'A_base')
+                    flush_abcd_outputs(paths, fold_rows, per_emotion_rows, manifest_rows, confusion_payload, status)
+                    base_result = result
+                else:
+                    base_matches = [
+                        row for row in fold_rows
+                        if row['Held-Out User ID'] == str(heldout_user)
+                        and row['Condition Full Name'] == abcd_condition_full_name('A_base')
+                    ]
+                    if base_matches:
+                        base_result = {
+                            'accuracy': float(base_matches[-1]['Accuracy']),
+                            'f1': float(base_matches[-1]['Macro F1 Score']),
+                        }
+                    else:
+                        base_result = evaluate_model_detailed(base_model, splits['test_common'], device, args.batch_size)
+
+                needs_b = any(
+                    not abcd_is_complete(status, model_name, heldout_user, key)
+                    for key in ['B_film7', 'B_film14', 'B_proto7', 'B_proto14']
+                )
+                if needs_b:
+                    base_feature_model = create_feature_extractor(model_name, base_state, device)
+                    feature_records = (
+                        splits['train_records'] + splits['val_records'] +
+                        splits['support_records'] + splits['test_records']
+                    )
+                    base_feature_map, base_feature_dim = extract_feature_map(
+                        base_feature_model, feature_records, device,
+                        batch_size=args.batch_size, num_workers=0,
+                    )
+                    joint_ckpt = checkpoint_dir / f"{model_name}_user{heldout_user}_joint_identity_emotion_embedding.pt"
+                    joint_meta = checkpoint_dir / f"{model_name}_user{heldout_user}_joint_identity_emotion_embedding.json"
+                    if joint_ckpt.exists() and joint_meta.exists():
+                        joint_info = read_json(joint_meta, {})
+                        joint_model = JointIdentityEmotionEmbeddingHead(
+                            input_dim=joint_info.get('input_dim', base_feature_dim),
+                            embedding_dim=joint_info.get('embedding_dim', args.abcd_joint_embedding_dim),
+                            num_identity_classes=joint_info.get('num_identity_classes', len(splits['train_user_ids'])),
+                            num_emotion_classes=len(EMOTIONS),
+                        ).to(device)
+                        joint_model.load_state_dict(torch.load(joint_ckpt, map_location=device))
+                        joint_time = joint_info.get('joint_embedding_time_sec', 0)
+                        print(f"Loaded joint identity-emotion embedding: {joint_ckpt}")
+                    else:
+                        joint_model, joint_time, joint_info = train_joint_identity_emotion_embedder(
+                            splits['train_records'], splits['val_records'],
+                            base_feature_map, base_feature_dim, device,
+                            embedding_dim=args.abcd_joint_embedding_dim,
+                            identity_loss_weight=args.abcd_joint_identity_loss_weight,
+                            epochs=args.epochs, patience=args.patience,
+                            batch_size=args.batch_size, lr=args.abcd_joint_lr,
+                        )
+                        joint_info.update({
+                            'joint_embedding_time_sec': joint_time,
+                            'completed_at': current_timestamp(),
+                        })
+                        torch.save(joint_model.state_dict(), joint_ckpt)
+                        write_json(joint_meta, joint_info)
+                    feature_map, feature_dim = extract_joint_embedding_map(
+                        joint_model, base_feature_map, feature_records, device,
+                        batch_size=args.batch_size,
+                    )
+                    joint_trainable, joint_total = trainable_parameter_counts(joint_model)
+                    for shots in ABCD_C_SHOTS:
+                        profile_start = time.time()
+                        heldout_profile = build_profile_vector(
+                            splits['enrollment_items'][shots], feature_map, feature_dim
+                        )
+                        profile_time = time.time() - profile_start
+                        missing = splits['missing_by_shots'][shots]
+                        profile_dim = len(heldout_profile)
+
+                        proto_key = f'B_proto{shots}'
+                        if not abcd_is_complete(status, model_name, heldout_user, proto_key):
+                            result = evaluate_prototype_model(
+                                feature_map, heldout_profile, feature_dim, splits['test_records']
+                            )
+                            row = abcd_result_row(
+                                proto_key, heldout_user, result, splits, base_result=base_result,
+                                model_name=model_name,
+                                enrollment_count=shots, enrollment_used=len(splits['enrollment_items'][shots]),
+                                missing_labels=missing,
+                                replacement_policy=args.balanced_replacement_policy,
+                                base_time=base_time, profile_time=profile_time,
+                                joint_embedding_time=joint_time,
+                                trainable_params=joint_trainable, total_params=joint_total,
+                                checkpoint_source=str(joint_ckpt),
+                            )
+                            fold_rows.append(row)
+                            per_emotion_rows.extend(abcd_per_emotion_rows(proto_key, heldout_user, result, model_name))
+                            confusion_payload.setdefault(model_name, {}).setdefault(str(heldout_user), {})[
+                                abcd_condition_full_name(proto_key)
+                            ] = result['confusion_matrix']
+                            abcd_mark_complete(status, model_name, heldout_user, proto_key)
+                            flush_abcd_outputs(paths, fold_rows, per_emotion_rows, manifest_rows, confusion_payload, status)
+
+                        film_key = f'B_film{shots}'
+                        if not abcd_is_complete(status, model_name, heldout_user, film_key):
+                            train_profiles, train_profile_paths, _ = build_user_profiles(
+                                splits['train_records'], shots, feature_map, feature_dim,
+                                seed=seed, replacement_policy=args.balanced_replacement_policy,
+                                allow_partial=True,
+                            )
+                            val_profiles, val_profile_paths, _ = build_user_profiles(
+                                splits['val_records'], shots, feature_map, feature_dim,
+                                seed=seed + 17, replacement_policy=args.balanced_replacement_policy,
+                                allow_partial=True,
+                            )
+                            film_train_records = [
+                                record for record in splits['train_records']
+                                if record['path'] not in train_profile_paths
+                            ] or splits['train_records']
+                            film_val_records = [
+                                record for record in splits['val_records']
+                                if record['path'] not in val_profile_paths
+                            ] or splits['val_records']
+                            film_model, film_time = train_film_conditioner(
+                                film_train_records, film_val_records, feature_map,
+                                train_profiles, val_profiles, feature_dim, profile_dim, device,
+                                epochs=args.epochs, patience=args.patience,
+                                batch_size=args.batch_size, lr=args.abcd_film_lr,
+                            )
+                            result = evaluate_film_model(
+                                film_model, feature_map, heldout_profile, splits['test_records'], device
+                            )
+                            trainable, total = trainable_parameter_counts(film_model)
+                            row = abcd_result_row(
+                                film_key, heldout_user, result, splits, base_result=base_result,
+                                model_name=model_name,
+                                enrollment_count=shots, enrollment_used=len(splits['enrollment_items'][shots]),
+                                missing_labels=missing,
+                                replacement_policy=args.balanced_replacement_policy,
+                                base_time=base_time, profile_time=profile_time,
+                                joint_embedding_time=joint_time, film_time=film_time,
+                                trainable_params=joint_trainable + trainable,
+                                total_params=joint_total + total,
+                                checkpoint_source=str(joint_ckpt),
+                            )
+                            fold_rows.append(row)
+                            per_emotion_rows.extend(abcd_per_emotion_rows(film_key, heldout_user, result, model_name))
+                            confusion_payload.setdefault(model_name, {}).setdefault(str(heldout_user), {})[
+                                abcd_condition_full_name(film_key)
+                            ] = result['confusion_matrix']
+                            abcd_mark_complete(status, model_name, heldout_user, film_key)
+                            flush_abcd_outputs(paths, fold_rows, per_emotion_rows, manifest_rows, confusion_payload, status)
+
+                for shots in ABCD_C_SHOTS:
+                    personal_records = [item['record'] for item in splits['enrollment_items'][shots]]
+                    personal_data = records_to_data(personal_records)
+                    for mode_key, _ in selected_c_layer_modes:
+                        condition_key = abcd_c_condition_key(shots, mode_key)
+                        if abcd_is_complete(status, model_name, heldout_user, condition_key):
+                            continue
+                        model_ft = create_model(model_name=model_name).to(device)
+                        model_ft.load_state_dict(base_state)
+                        personalized_model, finetune_time = stage2_personalize(
+                            model_ft, splits['train'], splits['val'], personal_data, device,
+                            epochs=args.epochs, patience=args.patience, batch_size=args.batch_size,
+                            classifier_only=False, unfreeze_ratio=mode_key,
+                            train_source=args.stage2_train_source,
+                            num_workers=args.num_workers,
+                            persistent_workers=not args.no_persistent_workers,
+                        )
+                        result = evaluate_model_detailed(personalized_model, splits['test_common'], device, args.batch_size)
+                        trainable, total = trainable_parameter_counts(personalized_model)
+                        row = abcd_result_row(
+                            condition_key, heldout_user, result, splits, base_result=base_result,
+                            model_name=model_name,
+                            enrollment_count=shots, enrollment_used=len(personal_records),
+                            missing_labels=splits['missing_by_shots'][shots],
+                            replacement_policy=args.balanced_replacement_policy,
+                            base_time=base_time, finetune_time=finetune_time,
+                            trainable_params=trainable, total_params=total,
+                            checkpoint_source=str(base_ckpt),
+                        )
+                        fold_rows.append(row)
+                        per_emotion_rows.extend(abcd_per_emotion_rows(condition_key, heldout_user, result, model_name))
+                        confusion_payload.setdefault(model_name, {}).setdefault(str(heldout_user), {})[
+                            abcd_condition_full_name(condition_key)
+                        ] = result['confusion_matrix']
+                        abcd_mark_complete(status, model_name, heldout_user, condition_key)
+                        flush_abcd_outputs(paths, fold_rows, per_emotion_rows, manifest_rows, confusion_payload, status)
+
+                d_conditions = [
+                    ('D_manyshot_upper_half_backbone_plus_head', 'upper_half_backbone_plus_head'),
+                    ('D_manyshot_full_network', 'full_network'),
+                ]
+                for condition_key, mode_key in d_conditions:
+                    if abcd_is_complete(status, model_name, heldout_user, condition_key):
+                        continue
+                    model_ft = create_model(model_name=model_name).to(device)
+                    model_ft.load_state_dict(base_state)
+                    personalized_model, finetune_time = stage2_personalize(
+                        model_ft, splits['train'], splits['val'], splits['support'], device,
+                        epochs=args.epochs, patience=args.patience, batch_size=args.batch_size,
+                        classifier_only=False, unfreeze_ratio=mode_key,
+                        train_source=args.stage2_train_source,
+                        num_workers=args.num_workers,
+                        persistent_workers=not args.no_persistent_workers,
+                    )
+                    result = evaluate_model_detailed(personalized_model, splits['test_common'], device, args.batch_size)
+                    trainable, total = trainable_parameter_counts(personalized_model)
+                    row = abcd_result_row(
+                        condition_key, heldout_user, result, splits, base_result=base_result,
+                        model_name=model_name,
+                        enrollment_count='Many-Shot', enrollment_used=len(splits['support']['images']),
+                        replacement_policy=args.balanced_replacement_policy,
+                        base_time=base_time, finetune_time=finetune_time,
+                        trainable_params=trainable, total_params=total,
+                        checkpoint_source=str(base_ckpt),
+                    )
+                    fold_rows.append(row)
+                    per_emotion_rows.extend(abcd_per_emotion_rows(condition_key, heldout_user, result, model_name))
+                    confusion_payload.setdefault(model_name, {}).setdefault(str(heldout_user), {})[
+                        abcd_condition_full_name(condition_key)
+                    ] = result['confusion_matrix']
+                    abcd_mark_complete(status, model_name, heldout_user, condition_key)
+                    flush_abcd_outputs(paths, fold_rows, per_emotion_rows, manifest_rows, confusion_payload, status)
+
+                scratch_key = 'D_scratch_upper_reference'
+                if not abcd_is_complete(status, model_name, heldout_user, scratch_key):
+                    combined_images = splits['train']['images'] + splits['support']['images']
+                    combined_labels = splits['train']['labels'] + splits['support']['labels']
+                    train_dataset = EmojiHeroDataset(combined_images, combined_labels, transform=train_transform)
+                    val_dataset = EmojiHeroDataset(splits['val']['images'], splits['val']['labels'], transform=val_transform)
+                    train_loader = make_data_loader(
+                        train_dataset, batch_size=args.batch_size, shuffle=True,
+                        num_workers=args.num_workers, persistent_workers=not args.no_persistent_workers
+                    )
+                    val_loader = make_data_loader(
+                        val_dataset, batch_size=args.batch_size, shuffle=False,
+                        num_workers=args.num_workers, persistent_workers=not args.no_persistent_workers
+                    )
+                    scratch_model = create_model(model_name=model_name).to(device)
+                    for param in scratch_model.parameters():
+                        param.requires_grad = True
+                    criterion = nn.CrossEntropyLoss(weight=calculate_class_weights(combined_labels, device))
+                    optimizer = optim.Adam(scratch_model.parameters(), lr=1e-4)
+                    start = time.time()
+                    scratch_model, _ = train_with_early_stopping(
+                        scratch_model, train_loader, val_loader, optimizer, criterion,
+                        device, args.epochs, args.patience, "ABCD Scratch Upper Reference"
+                    )
+                    scratch_time = time.time() - start
+                    result = evaluate_model_detailed(scratch_model, splits['test_common'], device, args.batch_size)
+                    trainable, total = trainable_parameter_counts(scratch_model)
+                    row = abcd_result_row(
+                        scratch_key, heldout_user, result, splits, base_result=base_result,
+                        model_name=model_name,
+                        enrollment_count='Many-Shot', enrollment_used=len(splits['support']['images']),
+                        replacement_policy=args.balanced_replacement_policy,
+                        base_time=0, finetune_time=scratch_time,
+                        trainable_params=trainable, total_params=total,
+                        checkpoint_source='Scratch retraining condition; no base checkpoint used',
+                    )
+                    fold_rows.append(row)
+                    per_emotion_rows.extend(abcd_per_emotion_rows(scratch_key, heldout_user, result, model_name))
+                    confusion_payload.setdefault(model_name, {}).setdefault(str(heldout_user), {})[
+                        abcd_condition_full_name(scratch_key)
+                    ] = result['confusion_matrix']
+                    abcd_mark_complete(status, model_name, heldout_user, scratch_key)
+                    flush_abcd_outputs(paths, fold_rows, per_emotion_rows, manifest_rows, confusion_payload, status)
+
+    flush_abcd_outputs(paths, fold_rows, per_emotion_rows, manifest_rows, confusion_payload, status)
+    print(f"\nABCD results saved to: {results_dir}")
 
 
 def run_abc14(args):
@@ -1734,8 +3218,19 @@ def main():
                         help="Disable persistent DataLoader workers; useful on Windows after worker hangs")
     parser.add_argument('--classifier-only', action='store_true', 
                         help="Stage 2: Train classifier only (default: all layers)")
-    parser.add_argument('--unfreeze-ratio', type=str, default='full', choices=['full', 'half', 'third'],
-                        help="Stage 2 unfreeze ratio: 'full' (all layers), 'half' (2/3 = blocks.3-6), 'third' (1/3 = blocks.5-6)")
+    parser.add_argument(
+        '--unfreeze-ratio', type=str, default='full',
+        choices=[
+            'full', 'half', 'third',
+            'classifier_head_only', 'last_two_blocks_plus_head',
+            'upper_half_backbone_plus_head', 'full_network',
+        ],
+        help=(
+            "Stage 2 unfreeze mode. Legacy aliases: full, half, third. "
+            "ABCD names: classifier_head_only, last_two_blocks_plus_head, "
+            "upper_half_backbone_plus_head, full_network."
+        ),
+    )
     parser.add_argument('--stage1-only', action='store_true',
                         help="Run only Stage 1 (Base model) for timing measurement")
     parser.add_argument('--retrain', action='store_true',
@@ -1744,8 +3239,24 @@ def main():
                         help="Compare Full vs Half fine-tuning using the SAME Stage 1 base model for fair comparison")
     parser.add_argument('--abc14', action='store_true',
                         help="Run A/base, B/neutral-auth-like, C/balanced14 personalization experiments")
+    parser.add_argument('--abcd', action='store_true',
+                        help="Run fresh ABCD experiment: A base, B FiLM/prototype profiles, C 7/14-shot fine-tuning, D many-shot references")
+    parser.add_argument('--abcd-resume-dir', type=Path, default=None,
+                        help="Existing ABCD result directory to resume from; completed user-condition rows are skipped")
+    parser.add_argument('--abcd-test-ratio', type=float, default=0.2,
+                        help="Held-out user common test holdout ratio for ABCD")
+    parser.add_argument('--abcd-film-lr', type=float, default=1e-4,
+                        help="Learning rate for the B/FiLM feature-profile conditioner")
+    parser.add_argument('--abcd-joint-embedding-dim', type=int, default=512,
+                        help="Embedding dimension for B joint identity-emotion projection")
+    parser.add_argument('--abcd-joint-lr', type=float, default=1e-4,
+                        help="Learning rate for the B joint identity-emotion projection")
+    parser.add_argument('--abcd-joint-identity-loss-weight', type=float, default=1.0,
+                        help="Identity-loss weight for the B joint identity-emotion projection")
+    parser.add_argument('--abcd-c-modes', type=str, default='all',
+                        help="Comma-separated C fine-tuning modes for ABCD, or all. Default runs all four planned C modes")
     parser.add_argument('--abc-finetune-modes', type=str, default='full,half,classifier_only',
-                        help="Comma-separated Stage 2 modes for ABC: full,half,third,classifier_only")
+                        help="Comma-separated Stage 2 modes for legacy ABC14: full,half,third,classifier_only")
     parser.add_argument('--neutral-shots', type=str, default='2,6,12',
                         help="Comma-separated Neutral image counts for B/neutral-auth-like; max 12 supports all 37 users")
     parser.add_argument('--balanced-replacement-policy', type=str, default='keep_14',
@@ -1755,11 +3266,13 @@ def main():
                         choices=['base_plus_personal', 'personal_only'],
                         help="Stage 2 data: rehearse base train data plus personal samples, or use personal samples only")
     parser.add_argument('--dry-run', action='store_true',
-                        help="For --abc14: verify data loading and write calibration manifest without training")
+                        help="For --abc14 or --abcd: verify data loading and write manifests without training")
     
     args = parser.parse_args()
     
-    if args.abc14:
+    if args.abcd:
+        run_abcd(args)
+    elif args.abc14:
         run_abc14(args)
     elif args.compare_modes:
         run_compare_modes(args)
