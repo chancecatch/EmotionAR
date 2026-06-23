@@ -110,6 +110,18 @@ def parse_csv_option(value):
     return [item.strip() for item in str(value).split(',') if item.strip()]
 
 
+VERIFICATION_BACKBONE_MODELS = ['resnet18', 'convnext_tiny']
+
+
+def resolve_model_names(args):
+    model_names = parse_csv_option(args.models) or ['efficientnet_b0']
+    if getattr(args, 'include_verification_backbones', False):
+        for model_name in VERIFICATION_BACKBONE_MODELS:
+            if model_name not in model_names:
+                model_names.append(model_name)
+    return model_names
+
+
 def parse_int_csv_option(value):
     items = parse_csv_option(value)
     if not items:
@@ -2114,7 +2126,7 @@ def run_abcd(args):
         fold_users = parse_csv_option(args.folds)
     if args.max_folds:
         fold_users = fold_users[:args.max_folds]
-    model_names = parse_csv_option(args.models) or ['efficientnet_b0']
+    model_names = resolve_model_names(args)
     abcd_c_modes = parse_csv_option(args.abcd_c_modes)
     if not abcd_c_modes:
         selected_c_layer_modes = ABCD_LAYER_MODES
@@ -2163,6 +2175,11 @@ def run_abcd(args):
         'data_dir': str(data_dir),
         'data_layout': data_layout,
         'models': model_names,
+        'requested_models': parse_csv_option(args.models) or ['efficientnet_b0'],
+        'include_verification_backbones': bool(args.include_verification_backbones),
+        'verification_backbone_models_added_by_option': (
+            VERIFICATION_BACKBONE_MODELS if args.include_verification_backbones else []
+        ),
         'fold_users': fold_users,
         'common_test_holdout_ratio': args.abcd_test_ratio,
         'replacement_policy': args.balanced_replacement_policy,
@@ -2589,6 +2606,11 @@ def run_abc14(args):
         'data_dir': str(data_dir),
         'data_layout': data_layout,
         'models': model_names,
+        'requested_models': parse_csv_option(args.models) or ['efficientnet_b0'],
+        'include_verification_backbones': bool(args.include_verification_backbones),
+        'verification_backbone_models_added_by_option': (
+            VERIFICATION_BACKBONE_MODELS if args.include_verification_backbones else []
+        ),
         'folds': fold_users,
         'neutral_shots': neutral_shots_list,
         'max_neutral_shots': max_neutral_shots,
@@ -3229,6 +3251,8 @@ def main():
     parser.add_argument('--results-dir', type=Path, default=RESULTS_DIR)
     parser.add_argument('--models', type=str, default='efficientnet_b0',
                         help="Comma-separated timm model names, e.g. efficientnet_b0,resnet18,convnext_tiny")
+    parser.add_argument('--include-verification-backbones', action='store_true',
+                        help="Append the two verification robustness backbones, resnet18 and convnext_tiny, to --models")
     parser.add_argument('--run-name', type=str, default='loo')
     parser.add_argument('--seed', type=int, default=SEED)
     parser.add_argument('--epochs', type=int, default=50, help="Epochs per stage")
