@@ -1061,6 +1061,13 @@ ABCD_LAYER_MODES = [
 ]
 
 ABCD_C_SHOTS = [7, 14]
+ABCD_DEFAULT_C_MODE_KEYS = ['upper_half_backbone_plus_head', 'full_network']
+ABCD_D_CONDITION_MODES = [
+    ('D_manyshot_upper_half_backbone_plus_head', 'upper_half_backbone_plus_head'),
+    ('D_manyshot_full_network', 'full_network'),
+    ('D_scratch_upper_reference', 'scratch'),
+]
+ABCD_DEFAULT_D_CONDITION_KEYS = ['D_manyshot_full_network']
 
 ABCD_CONDITION_FULL_NAMES = {
     'A_base': 'Subject-Independent Base Facial Emotion Recognition Model Without Personalization',
@@ -2120,6 +2127,18 @@ def run_abcd(args):
                 f"Supported: {list(layer_mode_names)}"
             )
         selected_c_layer_modes = [(mode, layer_mode_names[mode]) for mode in abcd_c_modes]
+    abcd_d_condition_keys = parse_csv_option(args.abcd_d_conditions)
+    if not abcd_d_condition_keys:
+        selected_d_conditions = ABCD_D_CONDITION_MODES
+    else:
+        d_condition_modes = dict(ABCD_D_CONDITION_MODES)
+        unsupported = [key for key in abcd_d_condition_keys if key not in d_condition_modes]
+        if unsupported:
+            raise ValueError(
+                f"Unsupported ABCD D upper/reference conditions: {unsupported}. "
+                f"Supported: {list(d_condition_modes)}"
+            )
+        selected_d_conditions = [(key, d_condition_modes[key]) for key in abcd_d_condition_keys]
 
     if args.abcd_resume_dir:
         results_dir = Path(args.abcd_resume_dir)
@@ -2149,10 +2168,12 @@ def run_abcd(args):
         'replacement_policy': args.balanced_replacement_policy,
         'c_finetuning_layer_modes': [mode_name for _, mode_name in selected_c_layer_modes],
         'd_upper_reference_conditions': [
-            ABCD_CONDITION_FULL_NAMES['D_manyshot_upper_half_backbone_plus_head'],
-            ABCD_CONDITION_FULL_NAMES['D_manyshot_full_network'],
-            ABCD_CONDITION_FULL_NAMES['D_scratch_upper_reference'],
+            ABCD_CONDITION_FULL_NAMES[condition_key]
+            for condition_key, _ in selected_d_conditions
         ],
+        'planned_condition_count_per_user_per_model': (
+            1 + 4 + (len(ABCD_C_SHOTS) * len(selected_c_layer_modes)) + len(selected_d_conditions)
+        ),
         'epochs': args.epochs,
         'patience': args.patience,
         'batch_size': args.batch_size,
@@ -2426,11 +2447,9 @@ def run_abcd(args):
                         abcd_mark_complete(status, model_name, heldout_user, condition_key)
                         flush_abcd_outputs(paths, fold_rows, per_emotion_rows, manifest_rows, confusion_payload, status)
 
-                d_conditions = [
-                    ('D_manyshot_upper_half_backbone_plus_head', 'upper_half_backbone_plus_head'),
-                    ('D_manyshot_full_network', 'full_network'),
-                ]
-                for condition_key, mode_key in d_conditions:
+                for condition_key, mode_key in selected_d_conditions:
+                    if condition_key == 'D_scratch_upper_reference':
+                        continue
                     if abcd_is_complete(status, model_name, heldout_user, condition_key):
                         continue
                     model_ft = create_model(model_name=model_name).to(device)
@@ -2463,7 +2482,10 @@ def run_abcd(args):
                     flush_abcd_outputs(paths, fold_rows, per_emotion_rows, manifest_rows, confusion_payload, status)
 
                 scratch_key = 'D_scratch_upper_reference'
-                if not abcd_is_complete(status, model_name, heldout_user, scratch_key):
+                if (
+                    any(condition_key == scratch_key for condition_key, _ in selected_d_conditions)
+                    and not abcd_is_complete(status, model_name, heldout_user, scratch_key)
+                ):
                     combined_images = splits['train']['images'] + splits['support']['images']
                     combined_labels = splits['train']['labels'] + splits['support']['labels']
                     train_dataset = EmojiHeroDataset(combined_images, combined_labels, transform=train_transform)
@@ -3240,7 +3262,7 @@ def main():
     parser.add_argument('--abc14', action='store_true',
                         help="Run A/base, B/neutral-auth-like, C/balanced14 personalization experiments")
     parser.add_argument('--abcd', action='store_true',
-                        help="Run fresh ABCD experiment: A base, B FiLM/prototype profiles, C 7/14-shot fine-tuning, D many-shot references")
+                        help="Run fresh reduced ABCD experiment: A base, B FiLM/prototype profiles, selected C 7/14-shot fine-tuning, selected D many-shot references")
     parser.add_argument('--abcd-resume-dir', type=Path, default=None,
                         help="Existing ABCD result directory to resume from; completed user-condition rows are skipped")
     parser.add_argument('--abcd-test-ratio', type=float, default=0.2,
@@ -3253,8 +3275,10 @@ def main():
                         help="Learning rate for the B joint identity-emotion projection")
     parser.add_argument('--abcd-joint-identity-loss-weight', type=float, default=1.0,
                         help="Identity-loss weight for the B joint identity-emotion projection")
-    parser.add_argument('--abcd-c-modes', type=str, default='all',
-                        help="Comma-separated C fine-tuning modes for ABCD, or all. Default runs all four planned C modes")
+    parser.add_argument('--abcd-c-modes', type=str, default=','.join(ABCD_DEFAULT_C_MODE_KEYS),
+                        help="Comma-separated C fine-tuning modes for ABCD, or all. Default runs upper_half_backbone_plus_head and full_network for a 10-condition run")
+    parser.add_argument('--abcd-d-conditions', type=str, default=','.join(ABCD_DEFAULT_D_CONDITION_KEYS),
+                        help="Comma-separated D condition keys for ABCD, or all. Default runs D_manyshot_full_network only for a 10-condition run")
     parser.add_argument('--abc-finetune-modes', type=str, default='full,half,classifier_only',
                         help="Comma-separated Stage 2 modes for legacy ABC14: full,half,third,classifier_only")
     parser.add_argument('--neutral-shots', type=str, default='2,6,12',
