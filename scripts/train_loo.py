@@ -1147,8 +1147,10 @@ ABCD_SUMMARY_FIELDS = [
     'Mean User Profile Construction Time Seconds',
     'Mean Fine-Tuning Time Seconds',
     'Mean Inference Time Per Image Milliseconds',
-    'Strict Complete-Emotion User Count',
+    'Mean Included User Count',
     'All User Count',
+    'Summary Mean Inclusion Rule Full Name',
+    'Excluded Missing Enrollment User-Emotion Pairs',
 ]
 
 ABCD_MANIFEST_FIELDS = [
@@ -1409,7 +1411,12 @@ def select_abcd_enrollment_records(support_records, shots, seed=42, replacement_
             for record in replacement_records:
                 if len(selected_items) >= shots:
                     break
-                add_item(record, target_label, 'similar_emotion_replacement', ID_TO_EMOTION[target_label])
+                add_item(
+                    record,
+                    int(record['label']),
+                    'similar_emotion_replacement_actual_emotion_slot',
+                    ID_TO_EMOTION[target_label],
+                )
 
     if len(selected_items) < shots and not allow_partial:
         raise RuntimeError(f"Only found {len(selected_items)} records for balanced{shots}")
@@ -1845,20 +1852,22 @@ def prediction_metrics(labels, preds, elapsed_sec=0):
     precision, recall, f1_values, support = precision_recall_fscore_support(
         labels, preds, labels=list(range(len(EMOTIONS))), zero_division=0
     )
+    present_labels = sorted(set(labels))
     other = [(label, pred) for label, pred in zip(labels, preds) if label != NEUTRAL_LABEL]
     if other:
         other_labels, other_preds = zip(*other)
+        present_other_labels = sorted(set(other_labels))
         other_accuracy = accuracy_score(other_labels, other_preds)
         other_f1 = f1_score(
             other_labels, other_preds, average='macro',
-            labels=[label for label in range(len(EMOTIONS)) if label != NEUTRAL_LABEL],
+            labels=present_other_labels,
             zero_division=0,
         )
     else:
         other_accuracy, other_f1 = 0, 0
     return {
         'accuracy': accuracy_score(labels, preds),
-        'f1': f1_score(labels, preds, average='macro', labels=list(range(len(EMOTIONS))), zero_division=0),
+        'f1': f1_score(labels, preds, average='macro', labels=present_labels, zero_division=0),
         'n_samples': len(labels),
         'other_accuracy': other_accuracy,
         'other_f1': other_f1,
@@ -1909,13 +1918,19 @@ def evaluate_film_model(film_model, feature_map, profile_vector, test_records, d
     return prediction_metrics(labels, preds, time.time() - start)
 
 
-def evaluate_prototype_model(feature_map, profile_vector, feature_dim, test_records):
+def evaluate_prototype_model(feature_map, profile_vector, feature_dim, test_records,
+                             unavailable_labels=None):
     prototypes = profile_vector.reshape(len(EMOTIONS), feature_dim)
+    prototype_norms = np.linalg.norm(prototypes, axis=1)
+    masked_labels = set(int(label) for label in (unavailable_labels or []))
+    masked_labels.update(int(label) for label in np.where(prototype_norms <= 1e-8)[0])
     labels, preds = [], []
     start = time.time()
     for record in test_records:
         feature = feature_map[record['path']]
         scores = prototypes @ feature
+        for label in masked_labels:
+            scores[label] = -np.inf
         preds.append(int(np.argmax(scores)))
         labels.append(int(record['label']))
     return prediction_metrics(labels, preds, time.time() - start)
@@ -2043,22 +2058,40 @@ def summarize_abcd_rows(fold_rows):
     for row in fold_rows:
         grouped[(row.get('Model Name', ''), row['Condition Full Name'])].append(row)
     summary_rows = []
+
     for (model_name, condition_full_name), rows in grouped.items():
-        accuracies = [float(row['Accuracy']) for row in rows]
-        f1_values = [float(row['Macro F1 Score']) for row in rows]
-        other_acc = [float(row['Non-Neutral Accuracy']) for row in rows]
-        other_f1 = [float(row['Non-Neutral Macro F1 Score']) for row in rows]
-        delta_acc = [float(row['Accuracy Difference From Base Percentage Points']) for row in rows]
-        delta_f1 = [float(row['Macro F1 Difference From Base Percentage Points']) for row in rows]
-        total_times = [float(row['Total Training Or Adaptation Time Seconds']) for row in rows]
-        joint_times = [float(row.get('Joint Identity Emotion Embedding Training Time Seconds', 0) or 0) for row in rows]
-        profile_times = [float(row['User Profile Construction Time Seconds']) for row in rows]
-        finetune_times = [float(row['Fine-Tuning Time Seconds']) for row in rows]
-        inference_times = [float(row['Mean Inference Time Per Image Milliseconds']) for row in rows]
-        wins = sum(row['Win Tie Loss Compared With Subject-Independent Base'].startswith('Win') for row in rows)
-        ties = sum(row['Win Tie Loss Compared With Subject-Independent Base'].startswith('Tie') for row in rows)
-        losses = sum(row['Win Tie Loss Compared With Subject-Independent Base'].startswith('Loss') for row in rows)
-        strict_count = sum(not row['Missing Enrollment Emotion Names'] for row in rows)
+        included_rows = [row for row in rows if not row['Missing Enrollment Emotion Names']]
+        excluded_rows = [row for row in rows if row['Missing Enrollment Emotion Names']]
+        if not included_rows:
+            included_rows = rows
+        accuracies = [float(row['Accuracy']) for row in included_rows]
+        f1_values = [float(row['Macro F1 Score']) for row in included_rows]
+        other_acc = [float(row['Non-Neutral Accuracy']) for row in included_rows]
+        other_f1 = [float(row['Non-Neutral Macro F1 Score']) for row in included_rows]
+        delta_acc = [float(row['Accuracy Difference From Base Percentage Points']) for row in included_rows]
+        delta_f1 = [float(row['Macro F1 Difference From Base Percentage Points']) for row in included_rows]
+        total_times = [float(row['Total Training Or Adaptation Time Seconds']) for row in included_rows]
+        joint_times = [float(row.get('Joint Identity Emotion Embedding Training Time Seconds', 0) or 0) for row in included_rows]
+        profile_times = [float(row['User Profile Construction Time Seconds']) for row in included_rows]
+        finetune_times = [float(row['Fine-Tuning Time Seconds']) for row in included_rows]
+        inference_times = [float(row['Mean Inference Time Per Image Milliseconds']) for row in included_rows]
+        wins = sum(row['Win Tie Loss Compared With Subject-Independent Base'].startswith('Win') for row in included_rows)
+        ties = sum(row['Win Tie Loss Compared With Subject-Independent Base'].startswith('Tie') for row in included_rows)
+        losses = sum(row['Win Tie Loss Compared With Subject-Independent Base'].startswith('Loss') for row in included_rows)
+        excluded_pairs = []
+        seen_exclusions = set()
+        for row in excluded_rows:
+            key = (row['Held-Out User ID'], row['Missing Enrollment Emotion Names'])
+            if key not in seen_exclusions:
+                seen_exclusions.add(key)
+                excluded_pairs.append(
+                    f"User {row['Held-Out User ID']}: {row['Missing Enrollment Emotion Names']}"
+                )
+        excluded_label = '; '.join(excluded_pairs)
+        inclusion_rule = (
+            f"Mean excludes missing-enrollment rows: {excluded_label}"
+            if excluded_label else "Mean includes all held-out users"
+        )
         summary_rows.append({
             'Model Name': model_name,
             'Experiment Family Full Name': rows[0]['Experiment Family Full Name'],
@@ -2079,8 +2112,10 @@ def summarize_abcd_rows(fold_rows):
             'Mean User Profile Construction Time Seconds': float(np.mean(profile_times)),
             'Mean Fine-Tuning Time Seconds': float(np.mean(finetune_times)),
             'Mean Inference Time Per Image Milliseconds': float(np.mean(inference_times)),
-            'Strict Complete-Emotion User Count': strict_count,
+            'Mean Included User Count': len(included_rows),
             'All User Count': len(rows),
+            'Summary Mean Inclusion Rule Full Name': inclusion_rule,
+            'Excluded Missing Enrollment User-Emotion Pairs': excluded_label,
         })
     return sorted(summary_rows, key=lambda row: (row.get('Model Name', ''), row['Condition Full Name']))
 
@@ -2356,7 +2391,8 @@ def run_abcd(args):
                         proto_key = f'B_proto{shots}'
                         if not abcd_is_complete(status, model_name, heldout_user, proto_key):
                             result = evaluate_prototype_model(
-                                feature_map, heldout_profile, feature_dim, splits['test_records']
+                                feature_map, heldout_profile, feature_dim, splits['test_records'],
+                                unavailable_labels=missing,
                             )
                             row = abcd_result_row(
                                 proto_key, heldout_user, result, splits, base_result=base_result,
